@@ -1,20 +1,42 @@
 .DS_Store
-.env
-.env.local
+.env*
+!.env.example
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp/
-.coverage
+.coverage*
+coverage.xml
 htmlcov/
 *.egg-info/
 .venv/
 
 # runtime data
-cidaren/bank.json.lock
-cidaren-server*.log
+*.lock
+*.log
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+*.sqlite3
+*.sqlite3-*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+proxy-recovery.json
+last-proxy-recovery.json
 .capture/
 data/
 .test-runs/
 .test-tmp/
 .test-cache/
+
+# Private task screenshots stay on this computer.
+/docs/image.png
+/docs/image copy.png
+/docs/image copy 2.png
+/docs/image copy 3.png
+/docs/image copy 4.png

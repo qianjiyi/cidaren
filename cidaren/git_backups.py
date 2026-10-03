@@ -25,6 +25,13 @@ LEGACY = 'backup/legacy-input.json'
 ARTIFACTS = {LEXICON, LEGACY}
 SECRET_FIELDS = {'usertoken', 'abc', 'auth_v', 'authorization', 'authorization-v',
                  'llm_key', 'api_key', 'apikey', 'access_token', 'refresh_token', 'password'}
+PRIVATE_SCREENSHOTS = frozenset({
+    'docs/image.png',
+    'docs/image copy.png',
+    'docs/image copy 2.png',
+    'docs/image copy 3.png',
+    'docs/image copy 4.png',
+})
 
 
 def _json_bytes(value):
@@ -57,6 +64,20 @@ def _excluded(name):
         return True
     return base.endswith(('.pem', '.key', '.pfx', '.p12', '.cer', '.crt', '.log', '.sqlite3',
                           '.sqlite', '.db', '.zip', '.bundle', '.pyc', '.pyo', '.tmp'))
+
+
+def _upload_excluded(name):
+    """Apply current upload rules without invalidating older backup manifests."""
+    parts = PurePosixPath(name).parts
+    base = parts[-1].casefold()
+    return (_excluded(name) or name.casefold() in PRIVATE_SCREENSHOTS
+            or base.startswith('.env') and base != '.env.example'
+            or any(p.casefold().endswith('.egg-info') for p in parts)
+            or base.startswith('.coverage')
+            or base in {'coverage.xml', 'proxy-recovery.json', 'last-proxy-recovery.json'}
+            or base.endswith(('.lock', '.sqlite3-wal', '.sqlite3-shm', '.sqlite3-journal',
+                              '.sqlite-wal', '.sqlite-shm', '.sqlite-journal',
+                              '.db-wal', '.db-shm', '.db-journal')))
 
 
 class GitBackups:
@@ -123,7 +144,7 @@ class GitBackups:
                 continue
             name = raw.decode('utf-8')
             parts = PurePosixPath(name).parts
-            if name.startswith('/') or '..' in parts or _excluded(name):
+            if name.startswith('/') or '..' in parts or _upload_excluded(name):
                 continue
             path = self.root.joinpath(*parts)
             if not path.exists():  # A locally deleted tracked file stays deleted.
@@ -211,6 +232,8 @@ class GitBackups:
                 parts = PurePosixPath(name).parts
                 if name.startswith('/') or '..' in parts or not re.fullmatch(r'[a-f0-9]{64}', digest):
                     raise ValueError('备份路径或校验值不合法')
+                # Upload-only exclusions must not block restoring historical
+                # wordbank snapshots that included task screenshots.
                 if name not in ARTIFACTS and _excluded(name):
                     raise ValueError('备份含有禁止上传的文件')
                 content = self._run('show', f'{commit}:{name}')

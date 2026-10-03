@@ -8,8 +8,9 @@ import subprocess
 import pytest
 
 from cidaren import bank_tools
+from cidaren import git_backups
 from cidaren.bank_store import BankError, BankStore
-from cidaren.git_backups import GitBackups, LEGACY, LEXICON, MANIFEST
+from cidaren.git_backups import GitBackups, LEGACY, LEXICON, MANIFEST, PRIVATE_SCREENSHOTS
 from tests.test_bank_store import bank, choice
 
 
@@ -196,6 +197,83 @@ def test_git_restores_first_migration_input_and_old_full_snapshot(repository, tm
     assert fresh.status()['cache'] == 1
     fresh.restore(migration)
     assert fresh.status()['cache'] == 0 and fresh.status()['legacy'] == 1
+
+
+def test_new_backups_omit_tracked_screenshots_but_restore_historical_wordbank(repository, tmp_path, monkeypatch):
+    root, remote, backend = repository
+    # Previously tracked screenshots still appear in ls-files even after ignore
+    # rules are added. Test with the actual ignore rules shipped by this project.
+    (root / '.gitignore').write_bytes((Path(__file__).parents[1] / '.gitignore').read_bytes())
+    images = {}
+    for name in sorted(PRIVATE_SCREENSHOTS):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        images[name] = b'private task progress: ' + name.encode()
+        path.write_bytes(images[name])
+        _git(root, 'add', '--force', '--', name)
+    (root / 'docs' / 'guide.md').write_text('Public documentation\n', encoding='utf-8')
+    _git(root, 'add', '.gitignore', 'docs/guide.md')
+    _git(root, 'commit', '-m', 'historically tracked task screenshots')
+    head = _git(root, 'rev-parse', 'HEAD')
+    main = _git(remote, 'rev-parse', 'main')
+    index = _git(root, 'ls-files', '--stage')
+    source = tmp_path / 'input.json'
+    source.write_text('{}', encoding='utf-8')
+    store = BankStore(root / 'data' / 'lexicon.sqlite3', backup_backend=backend)
+    store.migrate(source)
+    store.record(choice(), 7, 'test', 'confirmed')
+    historical_data = store._snapshot()
+    # Build a valid snapshot using the prior upload policy, then restore it using
+    # today's code. Historical manifests intentionally include these five files.
+    with monkeypatch.context() as prior_policy:
+        prior_policy.setattr(git_backups, '_upload_excluded', git_backups._excluded)
+        old = store.backup()
+    store.record(choice(word='later knowledge'), 42, 'test', 'confirmed')
+    current = store.backup()
+    old_names = set(_git(root, 'ls-tree', '-r', '--name-only', old['commit']).decode().splitlines())
+    names = set(_git(root, 'ls-tree', '-r', '--name-only', current['commit']).decode().splitlines())
+    assert PRIVATE_SCREENSHOTS <= old_names
+    assert PRIVATE_SCREENSHOTS.isdisjoint(names)
+    assert 'docs/guide.md' in names
+    ignored = _git(root, 'check-ignore', '--no-index', '--stdin',
+                   input=('\n'.join(sorted(PRIVATE_SCREENSHOTS)) + '\n').encode())
+    assert set(ignored.decode().splitlines()) == PRIVATE_SCREENSHOTS
+    assert all((root / name).read_bytes() == content for name, content in images.items())
+    assert _git(root, 'rev-parse', 'HEAD') == head
+    assert _git(root, 'ls-files', '--stage') == index
+    assert _git(remote, 'rev-parse', 'main') == main
+    assert _git(root, 'rev-parse', 'original-backup') == main
+    fresh = BankStore(tmp_path / 'restored' / 'lexicon.sqlite3', backup_backend=backend)
+    fresh.restore(old)
+    assert fresh._snapshot() == historical_data
+    fresh.restore(current)
+    assert fresh._snapshot() == store._snapshot()
+
+
+def test_accidentally_tracked_runtime_files_are_not_uploaded(repository):
+    root, remote, backend = repository
+    private = {
+        '.env.backup': b'USERTOKEN=private',
+        '.envrc': b'LLM_KEY=private',
+        '.coverage': b'test output',
+        'coverage.xml': b'test output',
+        'cidaren/bank.json.lock': b'runtime lock',
+        'proxy-recovery.json': b'private proxy state',
+        'lexicon.sqlite3-wal': b'private database content',
+        'lexicon.sqlite3-shm': b'private database content',
+        'credentials.pem': b'private certificate',
+        'run.log': b'private runtime log',
+    }
+    for name, content in private.items():
+        (root / name).write_bytes(content)
+        _git(root, 'add', '--force', '--', name)
+    original_index = _git(root, 'ls-files', '--stage')
+    result = backend.publish({LEGACY: b'{}'})
+    names = set(_git(root, 'ls-tree', '-r', '--name-only', result['commit']).decode().splitlines())
+    assert set(private).isdisjoint(names)
+    assert '.env.example' in names and 'cidaren/bank_store.py' in names
+    assert _git(root, 'ls-files', '--stage') == original_index
+    assert all((root / name).read_bytes() == content for name, content in private.items())
 
 
 @pytest.mark.parametrize('phase', ['push', 'verify'])
