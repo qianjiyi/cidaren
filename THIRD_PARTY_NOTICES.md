@@ -1,13 +1,12 @@
-# 来源说明
+# 第三方署名与许可证
 
-本整合项目包含并修改了以下本地项目的代码：
+本项目保留以下代码来源说明：
 
-- `D:\cidaren\cidaren-main`：网页控制台、任务执行、配置和本地题库。
-- `D:\cidaren\Easy_Cidaren-master`：仅参考 Token 获取的交互流程和临时代理切换方式。
+- `cidaren-main`：网页控制台、任务执行、配置与内置题库的代码来源。
+- `Easy_Cidaren-master`：Token 获取交互流程及临时代理切换方式的参考来源。
 
-任务接口、HTTP 请求头、鉴权校验、配置、调度及测试均以 `cidaren-main` 的网页版实现为
-基线，不采用桌面版的答题网络层。`Easy_Cidaren-master` 随附 GNU General Public License
-v3，许可证全文保存在本项目的 `LICENSE`。本项目没有复制原桌面界面、spaCy 模型、旧版
-Token 获取 EXE 或日志。
+随附的 GNU General Public License v3 全文保存在 [LICENSE](LICENSE)。分发本项目时，
+请保留许可证及本署名文件。
 
-mitmproxy 是独立的第三方依赖，其许可证和版权信息随安装包提供。
+Flask、requests、certifi 和 mitmproxy 是通过 Python 包管理器安装的独立第三方依赖。
+其版权与许可证信息由各依赖的安装包提供，依赖清单见 [pyproject.toml](pyproject.toml)。

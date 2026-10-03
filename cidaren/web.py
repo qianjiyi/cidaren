@@ -22,6 +22,7 @@ if __package__ in (None, ""):
         save_runtime_config,
     )
     from token_capture import CaptureManager, is_loopback_request
+    from bank_store import BankError, prepare_default_store
 else:
     from . import a as quiz  # noqa
     from .config import (
@@ -32,6 +33,7 @@ else:
         save_runtime_config,
     )
     from .token_capture import CaptureManager, is_loopback_request
+    from .bank_store import BankError, prepare_default_store
 
 app = Flask(__name__)
 
@@ -1008,11 +1010,18 @@ def main():
             probe.bind((host, port))
         except OSError as exc:
             raise SystemExit(f"端口 {port} 已被占用。请先关闭占用该端口的程序。详细信息: {exc}")
-    print(f"🌐 http://localhost:{port}")
-    print(f"📄 配置文件: {env_file_path()}")
-    if os.environ.get("CIDAREN_NO_BROWSER") != "1":
-        threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{port}")).start()
-    app.run(host=host, port=port, debug=False, threaded=True)
+    try:
+        bank = prepare_default_store()
+        with bank.runtime():
+            counts = bank.status()
+            print(f"📚 词库: {bank.path}，历史原文 {counts['legacy']} 条，缓存 {counts['cache']} 条")
+            print(f"🌐 http://localhost:{port}")
+            print(f"📄 配置文件: {env_file_path()}")
+            if os.environ.get("CIDAREN_NO_BROWSER") != "1":
+                threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{port}")).start()
+            app.run(host=host, port=port, debug=False, threaded=True)
+    except BankError as exc:
+        raise SystemExit(f'词库错误: {exc}')
 
 
 if __name__ == "__main__":
