@@ -1,0 +1,35 @@
+{
+  "artifacts": [
+    "backup/lexicon.json"
+  ],
+  "created_at": "2026-10-03T11:08:42+00:00",
+  "files": {
+    ".env.example": "67ab53b22ed646d60930b85b514b20cd25f0895507d3394e60eff1bfb801835c",
+    ".gitignore": "2a48f361f7cd428d5e609bf94f3b8c71b16d5cd8995ab62c6422696904e5e152",
+    "LICENSE": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "README.md": "378744f46ce27c76c6fdac8a67f6b01877f48f662ca68d88b57f0ea490949818",
+    "THIRD_PARTY_NOTICES.md": "9187ca5b8b121709cf1bf477cc9e5786fe8175c9c469c07e8ea78d6f337bbbf2",
+    "backup/lexicon.json": "cef05faa6da060c39cf0082f0ae372b03909337782fc3f0250f9ca1ba43a1832",
+    "cidaren/__init__.py": "a950ea36983dc8b5f1aa6380597a2964200c9928d93be0cf2be9ce17b183884c",
+    "cidaren/__main__.py": "5a4ba048c926a77146ebee1c911cce1576d961db7e6107634aeba93c6643c314",
+    "cidaren/_runner.py": "fc7116a2563ee1999aa3bedb8f62798dfcaf6c4f2ccc93e310b3819170bafbcb",
+    "cidaren/a.py": "c080ca93adc219c171758616bf200ba0fe2050b1e1e2d26fbac9956dd7c06643",
+    "cidaren/bank.json": "7fcac1248db6bd9f80b084b4e3614a13be8eac36aa8dcb387980db9166039106",
+    "cidaren/bank_store.py": "16335c79f377caf6371883fa6714695dbcbb38308403492bbb6608312e4c9cc4",
+    "cidaren/bank_tools.py": "ce078a08fac98c3c667c01984a245db4ec78a2b6c9f3557adfb91bb5b4fec30f",
+    "cidaren/config.py": "86581386ac5e4bbf9454d1a5e1fc0c7ab83c0f37610b700648ce8bef2024bbea",
+    "cidaren/git_backups.py": "43873ba5546e769bd36144772f8be1a8ad08ebf28636f192b71dd33f78913501",
+    "cidaren/mitm_addon.py": "08b8f894ad2f8b312139a5af4f4010742dfe1aca461b47869fd588e10825c650",
+    "cidaren/token_capture.py": "960bfcf78941833e16dc27ad34c7b049daf4455963d6c7a3ad5a1898677ac97c",
+    "cidaren/web.py": "47542524eb825ae31d6b909e23bde516e0a296fb10d2dfe115fd212753bfab91",
+    "main.py": "9da001c471578bbab79b994f00853d18b6635ddf83e7d2899a6374fce740560d",
+    "pyproject.toml": "bdf974f8d5ad82c8768d3ddba175cd7a2a5051dbff764e454856b49a7f5b4aa8",
+    "安装依赖.bat": "3b81ad809768baa1a599f1f78613e64f274376defaf2b2e489c35e75ef662432",
+    "点我启动.bat": "7722a35b7b8acdeab5b4d3e163e4ec705f2f7faf675743d57180901b37d24bf5",
+    "词库管理.bat": "8d57f4755d2033fe5f9283ee98e814737d28079bdc915a0bb21bdbe906627c46"
+  },
+  "format": "cidaren-git-backup",
+  "label": "merge-backups-into-main",
+  "source_head": "8dde8714ea543aa0d93f9ccc0993547aad66bbb5",
+  "version": 1
+}

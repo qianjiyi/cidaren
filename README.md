@@ -150,8 +150,10 @@ CLI 等价入口为 `conda run --no-capture-output -n cidaren python -m cidaren.
 
 ## Git 备份与恢复
 
-`main` 保存运行源码、脚本、项目配置、文档、许可证和内置 `bank.json`。
-`backups` 保存每次备份的源码及完整运行词库，通过普通提交历史保留各版本。
+`main` 已合并运行源码、脚本、项目配置、文档、许可证、内置 `bank.json`，以及
+`backup/lexicon.json` 中的完整词库快照。`backups` 继续保存后续自动及手动备份，通过普通
+提交历史保留各版本。运行数据写入 `data/lexicon.sqlite3`；保存最新学习结果时仍执行
+`backup`，跨电脑优先使用 `restore git:backups` 恢复最新备份。
 
 每次完整备份包含 `backup/lexicon.json` 和 `backup/manifest.json`；首次迁移备份包含
 `backup/legacy-input.json`。SQLite 备份接口生成一致快照，版本 2 JSON 保存六张业务表、
@@ -214,6 +216,7 @@ conda run --no-capture-output -n cidaren python -m cidaren.bank_tools status
 | `cidaren/bank_store.py`、`cidaren/bank_tools.py` | SQLite 词库和管理 CLI |
 | `cidaren/git_backups.py` | Git 快照、校验与下载 |
 | `cidaren/bank.json` | 内置迁移输入 |
+| `backup/lexicon.json`、`backup/manifest.json` | 合并时的完整词库快照及校验清单，可用于恢复 |
 | `安装依赖.bat`、`点我启动.bat`、`词库管理.bat` | 安装、启动与维护入口 |
 | `.env.example`、`pyproject.toml`、`.gitignore` | 配置模板、依赖与上传排除规则 |
 | `data/`、`.capture/`、`.env` | 本机生成的运行数据与私有配置，不上传 |
