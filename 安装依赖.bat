@@ -53,7 +53,7 @@ if errorlevel 1 (
 if not exist ".env" if exist ".env.example" copy /y ".env.example" ".env" >nul
 
 echo Installing dependencies into Conda environment: cidaren
-"%CIDAREN_CONDA%" run --no-capture-output -n cidaren python -m pip install -e ".[test]"
+"%CIDAREN_CONDA%" run --no-capture-output -n cidaren python -m pip install -e .
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed.
     pause

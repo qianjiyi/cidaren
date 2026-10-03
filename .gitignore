@@ -34,6 +34,10 @@ data/
 .test-tmp/
 .test-cache/
 
+# Development files are not part of the runtime distribution.
+/tests/
+/cidaren/test_config.py
+
 # Private task screenshots stay on this computer.
 /docs/image.png
 /docs/image copy.png

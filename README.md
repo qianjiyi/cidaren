@@ -21,7 +21,7 @@ cd cidaren
 ```
 
 [安装依赖.bat](安装依赖.bat) 会查找 Conda，创建或复用 `cidaren` 环境，将 Python 调整为
-3.12，安装 `.[test]` 并运行 `pip check`。首次安装还会从 [.env.example](.env.example) 创建
+3.12，安装项目及运行依赖并运行 `pip check`。首次安装还会从 [.env.example](.env.example) 创建
 `.env`；已有配置会保留。依赖及版本范围见 [pyproject.toml](pyproject.toml)，其中
 mitmproxy 固定为 `11.0.2`。Conda 不在常见目录时，可先从 Anaconda Prompt 运行脚本，
 或将 `CONDA_EXE` 设置为本机 `conda.exe` 的路径。
@@ -150,7 +150,7 @@ CLI 等价入口为 `conda run --no-capture-output -n cidaren python -m cidaren.
 
 ## Git 备份与恢复
 
-`main` 保存源码、脚本、测试、项目配置、文档、许可证和内置 `bank.json`。
+`main` 保存运行源码、脚本、项目配置、文档、许可证和内置 `bank.json`。
 `backups` 保存每次备份的源码及完整运行词库，通过普通提交历史保留各版本。
 
 每次完整备份包含 `backup/lexicon.json` 和 `backup/manifest.json`；首次迁移备份包含
@@ -164,8 +164,8 @@ CLI 等价入口为 `conda run --no-capture-output -n cidaren python -m cidaren.
 两台电脑同时备份可能导致一次普通推送被拒绝，重试前查看最新备份，避免覆盖其他电脑的进度。
 
 当前 GitHub 仓库公开，`backups` 中的完整词库和缓存也公开。上传排除实际 `.env`、密钥、
-证书、代理恢复记录、日志、SQLite 数据库、运行锁和测试产物。五张实际任务截图仅保留在
-本机，从新提交和后续自动备份中排除。已有提交和标签保留，含截图的历史词库备份仍可恢复。
+证书、代理恢复记录、日志、SQLite 数据库、运行锁、测试代码及产物和任务截图。运行目录
+只保留运行、安装及词库管理所需文件。已有提交和标签保留，历史词库备份仍可恢复。
 恢复兼容版本 1 JSON 和 SQLite 文件；版本 1 没有保存自增序号，会按现存记录重建。
 
 ## 跨电脑使用
@@ -190,23 +190,19 @@ cd cidaren
 用户名；Conda 环境不随项目复制。证书与代理恢复记录属于本机状态，直接复制时不带
 `.capture/`，让目标电脑首次获取时重新生成。
 
-## 测试
+## 运行检查
 
 在项目目录运行：
 
 ```powershell
-conda run --no-capture-output -n cidaren python -m pytest -q
+conda run --no-capture-output -n cidaren python -m pip check
+conda run --no-capture-output -n cidaren python -m cidaren.bank_tools status
 ```
 
-测试覆盖鉴权字段和 User-Agent 传递、字段缺失、验证失败、取消、超时、代理恢复、获取
-冲突、同源限制，以及班级、自学、循环、停止、日志和配置。词库测试覆盖三种输入格式、
-截断、选项换序、非连续标签、多义词、组词、填空、多选完整性、错误答案停用、并发写入、
-入库幂等和事务回滚。Git 测试使用本机临时仓库，覆盖上传失败、并发备份、历史恢复、
-校验、自增序号、隐私排除与历史截图兼容，不上传测试数据。
-
-`a vicious cycle`、`derive from`、`attribute … to …` 的模拟任务验证跨任务复用，确认词库
-命中时不调用 LLM。测试使用模拟客户端，不运行真实答题任务。实机获取仍需在 PC 微信中
-打开词达人，检查当前客户端的证书信任、请求捕获和任务刷新。
+第一条检查依赖是否兼容，第二条校验运行词库并显示记录统计。首次迁移未完成时先执行
+`migrate`；词库损坏时程序报错，不会自动创建空库覆盖。启动网页后，可通过配置中心与
+任务面板检查鉴权和日志。Token 获取需要在 PC 微信中打开词达人，检查证书信任、请求
+捕获和任务刷新。
 
 ## 当前目录
 
@@ -218,7 +214,6 @@ conda run --no-capture-output -n cidaren python -m pytest -q
 | `cidaren/bank_store.py`、`cidaren/bank_tools.py` | SQLite 词库和管理 CLI |
 | `cidaren/git_backups.py` | Git 快照、校验与下载 |
 | `cidaren/bank.json` | 内置迁移输入 |
-| `tests/`、`cidaren/test_config.py` | 自动化测试 |
 | `安装依赖.bat`、`点我启动.bat`、`词库管理.bat` | 安装、启动与维护入口 |
 | `.env.example`、`pyproject.toml`、`.gitignore` | 配置模板、依赖与上传排除规则 |
 | `data/`、`.capture/`、`.env` | 本机生成的运行数据与私有配置，不上传 |

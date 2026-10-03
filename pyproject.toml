@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cidaren"
 version = "0.1.0"
@@ -9,16 +13,11 @@ dependencies = [
     "requests>=2.32,<3",
 ]
 
-[project.optional-dependencies]
-test = [
-    "pytest>=8.3,<10",
-    "pytest-cov>=5,<8",
-]
-
 [project.scripts]
 cidaren = "cidaren.web:main"
 
-[tool.pytest.ini_options]
-addopts = "--basetemp=.test-tmp"
-cache_dir = ".test-cache"
-testpaths = ["cidaren/test_config.py", "tests"]
+[tool.setuptools]
+packages = ["cidaren"]
+
+[tool.setuptools.package-data]
+cidaren = ["bank.json"]
