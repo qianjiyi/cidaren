@@ -14,18 +14,21 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import socket
 import sqlite3
 import tempfile
+import time
 import unicodedata
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 LEGACY_FILE = Path(__file__).with_name("bank.json")
 SCHEMA_VERSION = 1
+EXPORT_VERSION = 2
 TABLES = ("metadata", "legacy", "records", "knowledge", "rejections", "observations")
-KNOWN_MODES = {0, 11, 15, 17, 22, 31, 32, 41, 51, 52}
+TABLE_ORDER = {'metadata':'key', 'legacy':'key', 'records':'id', 'knowledge':'id',
+               'rejections':'scope_key,answer_json', 'observations':'id'}
+KNOWN_MODES = {0, 11, 15, 17, 21, 22, 31, 32, 41, 51, 52}
 
 
 class BankError(RuntimeError):
@@ -70,17 +73,32 @@ def snapshot(topic):
             out[k] = v
     out.setdefault("stem", {})
     out.setdefault("options", [])
+    return json.loads(dump(out))
+
+
+def canonical_topic(topic, *, reorder=False):
+    out = snapshot(topic)
+    stem = out['stem']
+    for field in ('content', 'remark'):
+        if field in stem:
+            stem[field] = normalized(stem[field])
+    for opt in out['options']:
+        if 'content' in opt:
+            opt['content'] = norm(opt['content'])
+        if reorder:
+            opt.pop('answer_tag', None)
+    if reorder:
+        out['options'].sort(key=dump)
+    # Media identifiers and other non-display fields stay case sensitive.
     return out
 
 
 def exact_key(topic):
-    return hashlib.sha256(dump(normalized(snapshot(topic))).encode()).hexdigest()
+    return hashlib.sha256(dump(canonical_topic(topic)).encode()).hexdigest()
 
 
 def scope_key(topic):
-    data = snapshot(topic)
-    data["options"] = sorted(norm(o.get("content")) for o in data["options"])
-    return hashlib.sha256(dump(normalized(data)).encode()).hexdigest()
+    return hashlib.sha256(dump(canonical_topic(topic, reorder=True)).encode()).hexdigest()
 
 
 def _has_media(topic):
@@ -97,9 +115,9 @@ def semantic_key(topic):
     stem, remark = stem_obj.get("content", ""), stem_obj.get("remark", "")
     if mode not in KNOWN_MODES or _has_media(topic):
         return None
-    if mode in (0, 15, 22) and re.fullmatch(r"[A-Za-z][A-Za-z' -]*", stem.strip()):
+    if mode in (0, 15, 21, 22) and not remark and re.fullmatch(r"[A-Za-z][A-Za-z' -]*", stem.strip()):
         return dump(["definition", norm(stem)])
-    if mode == 17:
+    if mode == 17 and not remark:
         return dump(["reverse_definition", norm(stem)])
     if mode == 32:
         # Blank count and literal words remain part of the template.
@@ -110,7 +128,8 @@ def semantic_key(topic):
         return None
     if mode == 0:
         return None
-    return dump([mode, "collocation" if is_collocation(topic) else "context", norm(stem), normalized(remark)])
+    return dump([mode, "collocation" if is_collocation(topic) else "context", norm(stem), normalized(remark),
+                 topic.get('answer_num') if is_collocation(topic) else None])
 
 
 def tag_for_option(option, index):
@@ -118,7 +137,7 @@ def tag_for_option(option, index):
 
 
 def _same_tag(left, right):
-    if isinstance(left, bool) or isinstance(right, bool):
+    if type(left) not in (int, str) or type(right) not in (int, str):
         return False
     return type(left) == type(right) and left == right or (
         isinstance(left, (int, str)) and isinstance(right, (int, str)) and str(left) == str(right)
@@ -133,6 +152,9 @@ def encode_answer(topic, answer):
         words = [x.strip() for x in answer.replace("，", ",").split(",")]
         if not words or not all(words):
             raise BankError("组词答案为空")
+        blanks = len(re.findall(r'(?<!\w)_+(?!\w)|\{\}', (topic.get('stem') or {}).get('content','')))
+        if blanks and len(words) != blanks:
+            raise BankError('组词答案词数与题目空格数不一致')
         available = Counter(norm(o.get("content")) for o in opts)
         if Counter(norm(x) for x in words) - available:
             raise BankError("组词答案不在当前选项中或重复次数不合法")
@@ -159,7 +181,12 @@ def map_answer(topic, saved):
     opts = topic.get("options") or []
     kind = saved.get("kind")
     if kind == "words":
+        if topic.get('topic_mode') != 32:
+            return None
         items = saved.get("items") or []
+        blanks = len(re.findall(r'(?<!\w)_+(?!\w)|\{\}', (topic.get('stem') or {}).get('content','')))
+        if blanks and len(items) != blanks:
+            return None
         available = Counter(norm(o.get("content")) for o in opts)
         if not items or Counter(norm(x) for x in items) - available:
             return None
@@ -182,13 +209,35 @@ def map_answer(topic, saved):
                 return None
             i, opt = matches[0]
             tags.append(tag_for_option(opt, i))
+        if len({dump(tag) for tag in tags}) != len(tags):
+            return None
+        expected = topic.get('answer_num')
+        if kind == 'choices' and isinstance(expected, int) and len(tags) != expected:
+            return None
+        if kind == 'choice' and is_collocation(topic):
+            return None
         return tags[0] if kind == "choice" and tags else tags or None
     return None
 
 
+def _validate_saved(saved):
+    if not isinstance(saved, dict):
+        raise ValueError('答案不是结构化记录')
+    kind = saved.get('kind')
+    if kind in ('choice','fill'):
+        if not isinstance(saved.get('text'),str) or not saved['text'].strip():
+            raise ValueError('答案文字缺失')
+    elif kind in ('choices','words'):
+        items = saved.get('items')
+        if not isinstance(items,list) or not items or any(not isinstance(x,str) or not x.strip() for x in items):
+            raise ValueError('答案序列缺失或格式错误')
+    else:
+        raise ValueError('答案种类不合法')
+
+
 def legacy_keys(topic):
     mode = topic.get("topic_mode", "?")
-    stem = norm((topic.get("stem") or {}).get("content", ""))
+    stem = re.sub(r'\s+', ' ', (topic.get("stem") or {}).get("content", "")).strip().lower()
     remark = (topic.get("stem") or {}).get("remark", "") or ""
     if isinstance(remark, list):
         remark = json.dumps(remark, ensure_ascii=False, sort_keys=True)
@@ -198,6 +247,8 @@ def legacy_keys(topic):
 
 
 def parse_legacy(key, value):
+    if not isinstance(key, str) or not isinstance(value, dict) or 'ans' not in value:
+        raise BankError('旧题库记录格式不合法')
     parts = key.split("::")
     if len(parts) == 5 and parts[1] in ("norm", "coll"):
         mode, kind, stem, remark, blob = parts
@@ -219,7 +270,10 @@ def parse_legacy(key, value):
         except ValueError as exc:
             raise BankError("旧搭配备注无法解析") from exc
     opts = [{"content": s, "answer_tag": i} for i, s in enumerate(blob.split("|"))] if blob else []
-    topic = {"topic_mode": mode, "stem": {"content": value.get("stem", stem), "remark": remark}, "options": opts}
+    original_stem = value.get('stem', stem)
+    if not isinstance(original_stem, str):
+        raise BankError('旧题干不是文字')
+    topic = {"topic_mode": mode, "stem": {"content": original_stem, "remark": remark}, "options": opts}
     answer = value.get("ans")
     saved = encode_answer(topic, answer)
     if saved["kind"] in ("choice", "choices"):
@@ -230,23 +284,31 @@ def parse_legacy(key, value):
 
 
 @contextmanager
-def _file_lock(path):
+def _file_lock(path, *, wait=0):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as stream:
-        stream.seek(0)
-        if stream.read(1) == b"":
+        # Reading a locked byte on Windows raises PermissionError before we can
+        # translate lock contention into the normal maintenance error.
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
             stream.write(b"0")
             stream.flush()
         stream.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise BankError("词库维护或运行进程仍在使用此项目，请先停止相关进程") from exc
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() < deadline:
+                    time.sleep(.05)
+                    continue
+                raise BankError("词库维护或运行进程仍在使用此项目，请先停止相关进程") from exc
         try:
             yield
         finally:
@@ -265,20 +327,37 @@ class Match:
 
 
 class BankStore:
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, backup_backend=None):
         self.path = Path(path or os.environ.get("CIDAREN_BANK_DB") or ROOT / "data" / "lexicon.sqlite3").resolve()
+        self._backup_backend = backup_backend
+
+    def _backend(self):
+        if self._backup_backend is not None:
+            return self._backup_backend
+        from .git_backups import GitBackups
+        return GitBackups()
+
+    @contextmanager
+    def operation(self):
+        # Serialize maintenance commands without blocking task writes during
+        # uploads. Runtime leases separately protect database replacement.
+        with _file_lock(self.path.parent / '.bank-operation.lock'):
+            yield
 
     @contextmanager
     def connection(self, *, create=False):
         if not create and not self.path.is_file():
             raise BankError("词库尚未迁移，请运行词库管理 migrate")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        con = None
         try:
             con = sqlite3.connect(self.path, timeout=10)
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("PRAGMA busy_timeout=10000")
         except sqlite3.Error as exc:
+            if con is not None:
+                con.close()
             raise BankError(f"无法打开词库: {exc}") from exc
         try:
             if not create and con.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
@@ -307,7 +386,7 @@ class BankStore:
                 with socket.socket() as probe:
                     probe.settimeout(.3)
                     if probe.connect_ex(("127.0.0.1", 5001)) == 0:
-                        raise BankError("首次迁移前请关闭5001网页服务和任务")
+                        raise BankError("维护前请关闭5001网页服务和任务")
             for path in (self.path.parent / "runtime").glob("*.lock"):
                 with _file_lock(path):
                     pass  # Stale files are harmless; live holders make the lock fail.
@@ -316,7 +395,7 @@ class BankStore:
     @contextmanager
     def runtime(self):
         path = self.path.parent / "runtime" / f"{os.getpid()}-{uuid.uuid4().hex}.lock"
-        with _file_lock(self.path.parent / ".maintenance.lock"):
+        with _file_lock(self.path.parent / ".maintenance.lock", wait=5):
             lock = _file_lock(path)
             lock.__enter__()
         try:
@@ -335,7 +414,7 @@ class BankStore:
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS legacy (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, issue TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS records (
-                    id INTEGER PRIMARY KEY, exact_key TEXT NOT NULL, semantic_key TEXT,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, exact_key TEXT NOT NULL, semantic_key TEXT,
                     topic_json TEXT NOT NULL, answer_json TEXT NOT NULL, raw_answer_json TEXT NOT NULL,
                     stage TEXT NOT NULL CHECK(stage IN ('historical','cache','formal')),
                     verification TEXT NOT NULL CHECK(verification IN ('legacy','pending','confirmed','official')),
@@ -389,8 +468,16 @@ class BankStore:
             with self.connection() as con:
                 if con.execute("SELECT value FROM metadata WHERE key='migration' ").fetchone():
                     return {"already_migrated": True, **self.status()}
-        with self.maintenance(check_old_server=True):
-            raw = Path(source).read_bytes()
+        with self.operation(), self.maintenance(check_old_server=True):
+            # Recheck under the maintenance lock, including after a failed import.
+            if self.path.exists():
+                with self.connection() as con:
+                    if con.execute("SELECT 1 FROM metadata WHERE key='migration'").fetchone():
+                        return {'already_migrated': True, **self.status()}
+            try:
+                raw = Path(source).read_bytes()
+            except OSError as exc:
+                raise BankError(f'无法读取原题库: {exc}') from exc
             try:
                 bank = json.loads(raw)
             except (ValueError, UnicodeError) as exc:
@@ -398,54 +485,89 @@ class BankStore:
             if not isinstance(bank, dict) or any(not isinstance(v, dict) or 'ans' not in v for v in bank.values()):
                 raise BankError("原题库记录格式不合法，迁移已取消")
             digest = hashlib.sha256(raw).hexdigest()
-            backup_dir = self.path.parent / "backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup = backup_dir / f"legacy-{digest[:12]}.json"
-            if not backup.exists():
-                backup.write_bytes(raw)
-            elif backup.read_bytes() != raw:
-                raise BankError("历史备份校验失败")
-            self.initialize()
-            issues = Counter()
-            with self.transaction() as con:
-                for key, value in bank.items():
-                    issue = ""
-                    try:
-                        topic, answer = parse_legacy(key, value)
-                    except BankError as exc:
-                        issue = str(exc)
-                        issues[issue] += 1
-                    else:
-                        record_id = self._insert(con, topic, answer, value['ans'], 'historical', 'legacy', 'legacy')
-                        self._index(con, record_id)
-                    con.execute("INSERT INTO legacy VALUES(?,?,?)", (key, dump(value), issue))
-                con.execute("INSERT INTO metadata VALUES('migration',?)", (dump({"sha256": digest, "count": len(bank), "time": now(), "issues": dict(issues)}),))
-            return {"already_migrated": False, "backup": str(backup), **self.status()}
+            from .git_backups import LEGACY
+            backup = self._backend().publish({LEGACY:raw}, label='before-migration')
+            self._import_legacy(raw, bank, digest)
+            return {"already_migrated": False, "backup": backup, **self.status()}
+
+    def _import_legacy(self, raw, bank=None, digest=None):
+        """Import already backed-up input, also used for a legacy Git restore."""
+        if bank is None:
+            try:
+                bank = json.loads(raw)
+            except (ValueError, UnicodeError) as exc:
+                raise BankError('原题库JSON损坏') from exc
+        if not isinstance(bank, dict) or any(not isinstance(v, dict) or 'ans' not in v for v in bank.values()):
+            raise BankError('原题库记录格式不合法')
+        digest = digest or hashlib.sha256(raw).hexdigest()
+        self.initialize()
+        issues = Counter()
+        with self.transaction() as con:
+            for key, value in bank.items():
+                issue = ""
+                try:
+                    topic, answer = parse_legacy(key, value)
+                except BankError as exc:
+                    issue = str(exc)
+                    issues[issue] += 1
+                else:
+                    record_id = self._insert(con, topic, answer, value['ans'], 'historical', 'legacy', 'legacy')
+                    self._index(con, record_id)
+                con.execute("INSERT INTO legacy VALUES(?,?,?)", (key, dump(value), issue))
+            con.execute("INSERT INTO metadata VALUES('migration',?)", (dump({"sha256": digest, "count": len(bank), "time": now(), "issues": dict(issues)}),))
 
     def validate(self):
         with self.connection() as con:
             result = con.execute("PRAGMA quick_check").fetchone()[0]
             if result != "ok" or con.execute("PRAGMA foreign_key_check").fetchone():
                 raise BankError(f"词库完整性检查失败: {result}")
-            if not con.execute("SELECT 1 FROM metadata WHERE key='migration'").fetchone():
+            marker = con.execute("SELECT value FROM metadata WHERE key='migration'").fetchone()
+            if not marker:
                 raise BankError("词库迁移未完成，请重新执行 migrate")
+            try:
+                metadata = json.loads(marker[0])
+                if type(metadata['count']) is not int or metadata['count'] != con.execute('SELECT COUNT(*) FROM legacy').fetchone()[0]:
+                    raise ValueError('迁移数量不一致')
+                if not re.fullmatch(r'[0-9a-f]{64}',metadata['sha256']):
+                    raise ValueError('原题库哈希不合法')
+                for row in con.execute('SELECT topic_json,answer_json,raw_answer_json,exact_key FROM records'):
+                    topic, answer = json.loads(row[0]), json.loads(row[1])
+                    json.loads(row[2])
+                    if not isinstance(topic, dict) or not isinstance(topic.get('stem'), dict) or not isinstance(topic.get('options'), list):
+                        raise ValueError('题目格式不合法')
+                    if not isinstance(topic['stem'].get('content'),str) or any(not isinstance(o,dict) or not isinstance(o.get('content'),str) for o in topic['options']):
+                        raise ValueError('题干或选项文字损坏')
+                    if row[3] != exact_key(topic):
+                        raise ValueError('精确题目索引不一致')
+                    _validate_saved(answer)
+                for table, field in [('legacy','value_json'),('knowledge','answer_json'),('rejections','answer_json'),('observations','detail_json')]:
+                    for row in con.execute(f'SELECT {field} FROM {table}'):
+                        parsed = json.loads(row[0])
+                        if table in ('knowledge','rejections'):
+                            _validate_saved(parsed)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise BankError(f'词库记录损坏: {exc}') from exc
 
     def status(self):
         with self.connection() as con:
             stages = dict(con.execute("SELECT stage,COUNT(*) FROM records GROUP BY stage").fetchall())
             return {"database": str(self.path), "legacy": con.execute("SELECT COUNT(*) FROM legacy").fetchone()[0],
                     "legacy_issues": con.execute("SELECT COUNT(*) FROM legacy WHERE issue<>''").fetchone()[0],
+                    "legacy_candidates": con.execute("SELECT COUNT(*) FROM legacy WHERE issue=''").fetchone()[0],
                     "formal": stages.get("formal", 0), "historical": stages.get("historical", 0), "cache": stages.get("cache", 0),
                     "pending": con.execute("SELECT COUNT(*) FROM records WHERE stage='cache' AND verification='pending'").fetchone()[0],
                     "knowledge": con.execute("SELECT COUNT(DISTINCT semantic_key) FROM knowledge").fetchone()[0],
+                    "formal_knowledge": con.execute("SELECT COUNT(DISTINCT k.semantic_key) FROM knowledge k JOIN records r ON r.id=k.origin_id WHERE r.stage='formal'").fetchone()[0],
                     "conflicts": con.execute("SELECT COUNT(*) FROM (SELECT semantic_key FROM knowledge GROUP BY semantic_key HAVING COUNT(DISTINCT answer_json)>1)").fetchone()[0],
-                    "rejections": con.execute("SELECT COUNT(*) FROM rejections").fetchone()[0]}
+                    "rejections": con.execute("SELECT COUNT(*) FROM rejections").fetchone()[0],
+                    "migration": json.loads(con.execute("SELECT value FROM metadata WHERE key='migration'").fetchone()[0])}
 
     def record(self, topic, answer, source, verification="pending", *, complete=True, detail=None):
         if verification not in ("pending", "confirmed", "official"):
             raise BankError("未知验证状态")
         saved = encode_answer(topic, answer)
-        if saved['kind'] == 'choices' and not complete:
+        expected = topic.get('answer_num')
+        if saved['kind'] == 'choices' and (not complete or (isinstance(expected, int) and len(answer) != expected)):
             verification = 'pending'
         with self.transaction() as con:
             record_id = self._insert(con, topic, saved, answer, 'cache', verification, source)
@@ -457,13 +579,20 @@ class BankStore:
 
     def record_definitions(self, topic):
         ids = []
-        for opt in topic.get('options') or []:
-            if opt.get('content'):
-                # Definition cards can repeat answer_tag, so record one complete
-                # definition at a time and retain its original topic information.
-                card = {**snapshot(topic), 'options': [opt]}
-                ids.append(self.record(card, tag_for_option(opt, 0), 'official_definitions', 'official'))
+        with self.transaction() as con:
+            for i, opt in enumerate(topic.get('options') or []):
+                if not isinstance(opt.get('content'), str) or not opt['content'].strip():
+                    continue
+                saved = {'kind':'choice','text':opt['content']}
+                record_id = self._insert(con, topic, saved, tag_for_option(opt,i), 'cache', 'official', 'official_definitions')
+                con.execute('INSERT INTO observations(record_id,exact_key,outcome,detail_json,created_at) VALUES(?,?,?,?,?)',
+                            (record_id, exact_key(topic), 'official', dump({'definition_index':i}), now()))
+                ids.append(record_id)
         return ids
+
+    def legacy_issues(self):
+        with self.connection() as con:
+            return [dict(row) for row in con.execute("SELECT key,value_json,issue FROM legacy WHERE issue<>'' ORDER BY key")]
 
     def reject(self, topic, answer, *, detail=None):
         saved = encode_answer(topic, answer)
@@ -472,10 +601,17 @@ class BankStore:
             con.execute("INSERT INTO observations(exact_key,outcome,detail_json,created_at) VALUES(?,?,?,?)",
                         (exact_key(topic), 'rejected', dump(detail or {}), now()))
 
+    def is_rejected(self, topic, answer):
+        saved = encode_answer(topic, answer)
+        with self.connection() as con:
+            return bool(con.execute('SELECT 1 FROM rejections WHERE scope_key=? AND answer_json=?',
+                                    (scope_key(topic), dump(normalized(saved)))).fetchone())
+
     def lookup(self, topic):
         key, skey, scope = exact_key(topic), semantic_key(topic), scope_key(topic)
         reasons = []
         with self.connection() as con:
+            con.execute('BEGIN')
             rejected = {r[0] for r in con.execute("SELECT answer_json FROM rejections WHERE scope_key=?", (scope,))}
 
             def resolve(rows, source):
@@ -494,6 +630,8 @@ class BankStore:
                     return Match(next(iter(candidates.values())), source, '')
                 if len(candidates) > 1:
                     reasons.append('多个答案无法消歧')
+                if len(candidates) > 1:
+                    return Match(reason='；'.join(dict.fromkeys(reasons)))
                 return None
 
             for stage, label in [('formal', '精确题库'), ('cache', '临时缓存')]:
@@ -501,22 +639,35 @@ class BankStore:
                 hit = resolve(rows, label)
                 if hit:
                     return hit
-            # Only complete legacy answers participate. New full records replace
-            # legacy index assumptions after successful verification.
-            for old_key in legacy_keys(topic):
-                row = con.execute("SELECT value_json,issue FROM legacy WHERE key=?", (old_key,)).fetchone()
-                if row and not row['issue']:
-                    old_topic, saved = parse_legacy(old_key, json.loads(row['value_json']))
-                    if not _has_media(topic):
-                        hit = resolve([{'answer_json': dump(normalized(saved))}], '历史词库候选')
-                        if hit:
-                            return hit
+            # Curated knowledge precedes unverified historical candidates.
             if skey:
                 for stage, label in [('formal', '正式词库'), ('historical', '历史词库候选')]:
-                    rows = con.execute("SELECT k.answer_json FROM knowledge k JOIN records r ON r.id=k.origin_id WHERE k.semantic_key=? AND r.stage=?", (skey,stage)).fetchall()
+                    history_key = json.loads(skey)
+                    if stage == 'historical' and is_collocation(topic):
+                        history_key[-1] = None
+                    rows = con.execute("SELECT k.answer_json FROM knowledge k JOIN records r ON r.id=k.origin_id WHERE k.semantic_key=? AND r.stage=?", (dump(history_key),stage)).fetchall()
                     hit = resolve(rows, label)
                     if hit:
                         return hit
+            legacy_rows = []
+            for old_key in legacy_keys(topic):
+                row = con.execute("SELECT value_json,issue FROM legacy WHERE key=?", (old_key,)).fetchone()
+                if row and not row['issue'] and not _has_media(topic):
+                    old_topic, saved = parse_legacy(old_key, json.loads(row['value_json']))
+                    # Missing legacy context must never be inferred from a new topic.
+                    old_remark = normalized(old_topic['stem'].get('remark') or '')
+                    current_remark = normalized((topic.get('stem') or {}).get('remark') or '')
+                    if old_remark != current_remark:
+                        reasons.append('历史记录缺少兼容上下文')
+                        continue
+                    if topic.get('topic_mode') not in KNOWN_MODES:
+                        old_texts = [norm(o.get('content')) for o in old_topic['options']]
+                        if old_texts != [norm(o.get('content')) for o in topic.get('options') or []]:
+                            continue
+                    legacy_rows.append({'answer_json':dump(normalized(saved))})
+            hit = resolve(legacy_rows, '历史精确候选')
+            if hit:
+                return hit
         return Match(reason='；'.join(dict.fromkeys(reasons)) or '词库没有兼容记录')
 
     def preview(self, ids=None):
@@ -538,23 +689,56 @@ class BankStore:
                             'answer':json.loads(row['answer_json']), 'cross_task':bool(row['semantic_key']), 'source':row['source']})
             return out
 
-    def backup(self, label='manual'):
+    @staticmethod
+    def _data(con):
+        tables = {name:[dict(row) for row in con.execute(f'SELECT * FROM {name} ORDER BY {TABLE_ORDER[name]}')]
+                  for name in TABLES}
+        sequences = dict(con.execute('SELECT name,seq FROM sqlite_sequence ORDER BY name'))
+        return {'tables':tables, 'sequences':sequences}
+
+    @staticmethod
+    def _fingerprint(data):
+        return hashlib.sha256(dump(data).encode('utf-8')).hexdigest()
+
+    def _snapshot(self):
         self.validate()
-        folder = self.path.parent / 'backups'
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{label}-{uuid.uuid4().hex[:8]}.sqlite3"
+        # SQLite's backup API creates a consistent in-memory copy, even while
+        # task processes write. No standalone local backup remains.
         with self.connection() as src:
-            dest = sqlite3.connect(path)
+            dest = sqlite3.connect(':memory:')
+            dest.row_factory = sqlite3.Row
             try:
                 src.backup(dest)
+                return self._data(dest)
             finally:
                 dest.close()
-        return path
+
+    @staticmethod
+    def _export_bytes(data):
+        return (json.dumps({'format':'cidaren-wordbank', 'version':EXPORT_VERSION,
+                            'schema_version':SCHEMA_VERSION, 'exported_at':now(), **data},
+                           ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode('utf-8')
+
+    def backup(self, label='manual'):
+        from .git_backups import LEXICON
+        data = self._snapshot()
+        result = self._backend().publish({LEXICON:self._export_bytes(data)}, label=label)
+        return {**result, 'state_sha256':self._fingerprint(data)}
+
+    def _check_backed_up(self, con, backup):
+        if self._fingerprint(self._data(con)) != backup['state_sha256']:
+            raise BankError('上传期间词库已有新写入，本次维护已取消，原数据保留；请重试')
 
     def promote(self, ids=None):
+        with self.operation():
+            return self._promote(ids)
+
+    def _promote(self, ids):
         backup = self.backup('before-promote')
+        review = [row for row in self.preview(ids) if row['classification'].startswith('冲突')]
         promoted, skipped = [], []
         with self.transaction() as con:
+            self._check_backed_up(con, backup)
             rows = con.execute("SELECT * FROM records WHERE stage='cache' ORDER BY id").fetchall()
             for row in rows:
                 if ids is not None and row['id'] not in ids:
@@ -574,49 +758,98 @@ class BankStore:
                     target_id = row['id']
                 self._index(con,target_id)
                 promoted.append(row['id'])
-        return {'promoted':promoted,'skipped':skipped,'backup':str(backup)}
+        return {'promoted':promoted,'skipped':skipped,'conflicts':[r['id'] for r in review if r['id'] in promoted], 'backup':backup}
 
     def clear_cache(self):
-        backup = self.backup('before-clear')
-        with self.transaction() as con:
-            count = con.execute("SELECT COUNT(*) FROM records WHERE stage='cache'").fetchone()[0]
-            con.execute("DELETE FROM records WHERE stage='cache'")
-        return {'cleared':count,'backup':str(backup)}
+        with self.operation():
+            backup = self.backup('before-clear')
+            with self.transaction() as con:
+                self._check_backed_up(con, backup)
+                count = con.execute("SELECT COUNT(*) FROM records WHERE stage='cache'").fetchone()[0]
+                con.execute("DELETE FROM records WHERE stage='cache'")
+            return {'cleared':count,'backup':backup}
 
     def export(self, target):
-        self.validate()
         target = Path(target).resolve()
         if target == self.path or target == LEGACY_FILE:
             raise BankError('导出路径不能覆盖词库或原题库')
-        with self.connection() as con:
-            con.execute('BEGIN')
-            data = {name:[dict(row) for row in con.execute(f'SELECT * FROM {name}')] for name in TABLES}
-        _atomic_json(target, {'format':'cidaren-wordbank','version':SCHEMA_VERSION,'exported_at':now(),'tables':data})
+        _atomic_json(target, json.loads(self._export_bytes(self._snapshot())))
         return {'export':str(target)}
 
     def restore(self, backup):
-        backup = Path(backup).resolve()
-        if backup == self.path:
-            raise BankError('不能用当前数据库恢复自身')
-        with self.maintenance():
-            # Validate the source before backing up or replacing the destination.
-            source = BankStore(backup)
-            source.validate()
-            previous = self.backup('before-restore') if self.path.exists() else None
-            fd, temp = tempfile.mkstemp(prefix='.restore-',suffix='.sqlite3',dir=self.path.parent)
-            os.close(fd)
-            try:
-                with source.connection() as src:
-                    dest = sqlite3.connect(temp)
-                    try:
-                        src.backup(dest)
-                    finally:
-                        dest.close()
+        if isinstance(backup, dict):
+            backup = backup['reference']
+        reference = str(backup)
+        with self.operation(), self.maintenance(check_old_server=True):
+            with tempfile.TemporaryDirectory(prefix='.restore-', dir=self.path.parent) as folder:
+                legacy = False
+                if reference.startswith('git:'):
+                    downloaded = self._backend().download(reference, folder)
+                    source_path, legacy = downloaded['path'], downloaded['kind'] == 'legacy'
+                    reference = downloaded['reference']
+                else:
+                    source_path = Path(backup).resolve()
+                    if source_path == self.path:
+                        raise BankError('不能用当前数据库恢复自身')
+                    if not source_path.is_file():
+                        raise BankError('恢复文件不存在')
+                # Fully validate the candidate before uploading the current
+                # state or replacing it. Temporary files are always removed.
+                temp = Path(folder) / 'candidate.sqlite3'
+                if legacy:
+                    BankStore(temp)._import_legacy(source_path.read_bytes())
+                elif source_path.read_bytes()[:16] == b'SQLite format 3\0':
+                    source = BankStore(source_path)
+                    source.validate()
+                    with source.connection() as src:
+                        dest = sqlite3.connect(temp)
+                        try:
+                            src.backup(dest)
+                        finally:
+                            dest.close()
+                else:
+                    self._restore_json(source_path, temp)
                 BankStore(temp).validate()
-                os.replace(temp,self.path)
-            finally:
-                Path(temp).unlink(missing_ok=True)
-            return {'restored':str(backup),'previous_backup':str(previous) if previous else None}
+                previous = self.backup('before-restore') if self.path.exists() else None
+                if previous:
+                    with self.transaction() as con:
+                        self._check_backed_up(con, previous)
+                os.replace(temp, self.path)
+                return {'restored':reference, 'previous_backup':previous}
+
+    @staticmethod
+    def _restore_json(backup, temp):
+        try:
+            data = json.loads(backup.read_bytes())
+            if (not isinstance(data, dict) or data.get('format') != 'cidaren-wordbank'
+                    or type(data.get('version')) is not int or data['version'] not in (1, EXPORT_VERSION)
+                    or set(data['tables']) != set(TABLES)):
+                raise ValueError('不是兼容的词库导出文件')
+            if data['version'] == EXPORT_VERSION and (type(data.get('schema_version')) is not int
+                                                      or data['schema_version'] != SCHEMA_VERSION):
+                raise ValueError('数据库格式版本不兼容')
+            target = BankStore(temp)
+            target.initialize()
+            with target.transaction() as con:
+                for table in TABLES:
+                    columns = [row[1] for row in con.execute(f'PRAGMA table_info({table})')]
+                    rows = data['tables'][table]
+                    if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != set(columns) for row in rows):
+                        raise ValueError(f'{table} 表格式不合法')
+                    marks = ','.join('?' for _ in columns)
+                    con.executemany(f"INSERT INTO {table}({','.join(columns)}) VALUES({marks})",
+                                    [[row[c] for c in columns] for row in rows])
+                if data['version'] == EXPORT_VERSION:
+                    sequences = data.get('sequences')
+                    maximum = con.execute('SELECT COALESCE(MAX(id),0) FROM records').fetchone()[0]
+                    if (not isinstance(sequences, dict) or not set(sequences) <= {'records'}
+                            or any(type(v) is not int or not 0 <= v <= 9223372036854775807 for v in sequences.values())
+                            or sequences.get('records', 0) < maximum):
+                        raise ValueError('自增序号缺失或不合法')
+                    con.execute('DELETE FROM sqlite_sequence')
+                    con.executemany('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)', sequences.items())
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise BankError(f'恢复文件损坏或格式不兼容: {exc}') from exc
 
 
 def _atomic_json(path, data):

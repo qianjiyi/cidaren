@@ -19,5 +19,6 @@ test = [
 cidaren = "cidaren.web:main"
 
 [tool.pytest.ini_options]
-addopts = "--basetemp=.pytest-tmp"
+addopts = "--basetemp=.test-tmp"
+cache_dir = ".test-cache"
 testpaths = ["cidaren/test_config.py", "tests"]

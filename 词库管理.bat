@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+chcp 65001 >nul
 cd /d "%~dp0"
 
 set "PYTHONUTF8=1"
@@ -21,26 +22,19 @@ for %%I in (
 ) do if not defined CIDAREN_CONDA if exist "%%~fI" set "CIDAREN_CONDA=%%~fI"
 
 if not defined CIDAREN_CONDA (
-    echo [ERROR] Conda was not found.
-    echo Install Anaconda or Miniconda, then run 安装依赖.bat.
+    echo [ERROR] Conda was not found. Install Anaconda or Miniconda first.
     pause
     exit /b 1
 )
 
 "%CIDAREN_CONDA%" run -n cidaren python -c "import sys; assert sys.version_info[:2] == (3, 12)" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Conda environment cidaren with Python 3.12 was not found.
-    echo Run 安装依赖.bat first.
+    echo [ERROR] Install project dependencies first.
     pause
     exit /b 1
 )
 
-echo Starting CiDaRen at http://127.0.0.1:5001
-"%CIDAREN_CONDA%" run --no-capture-output -n cidaren python -m cidaren
+"%CIDAREN_CONDA%" run --no-capture-output -n cidaren python -m cidaren.bank_tools %*
 set "CIDAREN_EXIT_CODE=%ERRORLEVEL%"
-
-if not "%CIDAREN_EXIT_CODE%"=="0" (
-    echo [ERROR] CiDaRen exited with code %CIDAREN_EXIT_CODE%.
-    pause
-)
+if "%~1"=="" pause
 exit /b %CIDAREN_EXIT_CODE%

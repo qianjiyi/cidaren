@@ -14,3 +14,7 @@ htmlcov/
 cidaren/bank.json.lock
 cidaren-server*.log
 .capture/
+data/
+.test-runs/
+.test-tmp/
+.test-cache/

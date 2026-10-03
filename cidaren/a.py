@@ -4,18 +4,18 @@
 """
 
 import base64, hashlib, json, os, random, re, time, requests, uuid, certifi
-from contextlib import contextmanager
 
 try:
     from .config import get_missing_auth_fields, get_runtime_config
+    from .bank_store import BankError, default_store, prepare_default_store, encode_answer, tag_for_option, norm
 except ImportError:  # pragma: no cover
     from config import get_missing_auth_fields, get_runtime_config
+    from bank_store import BankError, default_store, prepare_default_store, encode_answer, tag_for_option, norm
 
 SALT = "ajfajfamsnfaflfasakljdlalkflak"
 VERSION = "2.7.0.260507_01"
 BASE = "https://app.vocabgo.com/studentv1/api"
 STUDENT_BASE = "https://app.vocabgo.com/student/api"
-BANK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bank.json")
 WORD_PAT = re.compile(r'\{(\w+)\}')
 
 JV = {
@@ -69,71 +69,13 @@ def _decrypt(resp: dict) -> dict:
 
 def _ms(): return int(time.time() * 1000)
 def _sleep(lo=1.5, hi=3.5): time.sleep(random.uniform(lo, hi))
-def _norm(s): return re.sub(r'\s+', '', s).lower().strip()
-
-# ── 题库 ──
-def _bank_load():
-    if os.path.exists(BANK_FILE):
-        try: return json.load(open(BANK_FILE, encoding="utf-8"))
-        except: pass
-    return {}
-
-@contextmanager
-def _bank_lock(lock_path):
-    with open(lock_path, "a+b") as lf:
-        if os.name == "nt":
-            import msvcrt
-            lf.seek(0)
-            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                lf.seek(0)
-                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
-
-def _bank_save(bank):
-    """多进程安全: 用 pid 区分 tmp + 文件锁串行化合并"""
-    lock_path = BANK_FILE + ".lock"
-    tmp_path = f"{BANK_FILE}.{os.getpid()}.tmp"
-    with _bank_lock(lock_path):
-        try:
-            # 锁内重新加载, 与磁盘最新状态合并 (防止覆盖其他进程的写入)
-            disk = {}
-            if os.path.exists(BANK_FILE):
-                try: disk = json.load(open(BANK_FILE, encoding="utf-8"))
-                except: pass
-            disk.update(bank)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(disk, f, ensure_ascii=False, indent=1)
-            os.replace(tmp_path, BANK_FILE)
-        finally:
-            try:
-                if os.path.exists(tmp_path): os.remove(tmp_path)
-            except: pass
+def _norm(s): return norm(s)
 
 def _chat_completions_url(llm_url: str) -> str:
     base = llm_url.rstrip("/")
     if base.endswith("/v1"):
         return f"{base}/chat/completions"
     return f"{base}/v1/chat/completions"
-
-def _topic_key(t):
-    mode = t.get("topic_mode", "?")
-    stem = (t.get("stem") or {}).get("content", "")
-    remark = (t.get("stem") or {}).get("remark", "") or ""
-    if isinstance(remark, list):
-        remark = json.dumps(remark, ensure_ascii=False, sort_keys=True)
-    opts = "|".join((o.get("content") or "")[:20] for o in (t.get("options") or []))
-    sn = re.sub(r'\s+', ' ', stem).strip().lower()
-    kind = "coll" if _is_collocation(t) else "norm"
-    return f"{mode}::{kind}::{sn}::{remark}::{opts.lower()}"
 
 def _is_collocation(topic):
     """搭配题: mode=31 但 stem.remark 是 list (含 relation 字段)"""
@@ -170,6 +112,14 @@ def _llm_answer(topic, word_defs):
 {opts_str}
 
 请选出正确的词并按正确顺序排列。只回答逗号分隔的选项内容(如: in,many,instances), 不要其他文字。"""
+    elif _is_collocation(topic):
+        prompt = f"""{wd_str}题目: 选择与「{stem}」匹配的搭配词
+搭配提示: {remark}
+需选数量: {topic.get('answer_num') or 2}
+选项:
+{opts_str}
+
+只回答逗号分隔的选项编号(如: 0,2)，不要其他文字。"""
     elif mode == 31:
         prompt = f"""{wd_str}题目: 以下哪个是单词「{stem}」的正确释义?
 选项:
@@ -259,17 +209,22 @@ def _llm_answer(topic, word_defs):
                     return ",".join(words)
             return ans_text
         else:
-            m = re.search(r'\d+', ans_text)
+            if not opts:
+                return ans_text or None
+            if _is_collocation(topic):
+                parts = [p for p in re.split(r'[,，\s]+', ans_text) if p]
+                if parts and all(re.fullmatch(r'\d+', p) for p in parts):
+                    indexes = list(dict.fromkeys(int(p) for p in parts))
+                    if all(0 <= i < len(opts) for i in indexes):
+                        return [tag_for_option(opts[i], i) for i in indexes]
+                return None
+            m = re.fullmatch(r'\d+', ans_text)
             if m:
-                return int(m.group())
+                i = int(m.group())
+                return tag_for_option(opts[i], i) if i < len(opts) else None
             ans_norm = _norm(ans_text)
-            for i, opt in enumerate(opts):
-                content = opt.get("content", "")
-                opt_norm = _norm(content)
-                if ans_norm and (ans_norm == opt_norm or ans_norm in opt_norm or opt_norm in ans_norm):
-                    return opt.get("answer_tag", i)
-            if ("{}" in stem or "_" in stem) and not opts and ans_text:
-                return ans_text
+            matches = [tag_for_option(opt,i) for i,opt in enumerate(opts) if ans_norm and ans_norm == _norm(opt.get('content'))]
+            return matches[0] if len(matches) == 1 else None
     except Exception as e:
         print(f"    LLM error: {e}")
     return None
@@ -295,8 +250,8 @@ def _match_answer(topic, word_defs):
         return None
 
     # mode=31 或其他选择题: stem 是单词, 选项是释义
-    if mode in (31, None) or (mode and mode != 0):
-        word = re.sub(r'\s+', '', stem).lower()
+    if mode in (15, 21, 22):
+        word = norm(stem)
         if word and not word.startswith('_'):
             return _match_word_to_def(word, opts, word_defs)
 
@@ -315,37 +270,21 @@ def _match_collocation(remark_list, opts):
     if not relations:
         return None
     tags = []
-    for opt in opts:
+    for i, opt in enumerate(opts):
         c = (opt.get("content") or "").strip().lower()
         if c in relations:
-            tags.append(opt.get("answer_tag"))
+            if sum(norm(o.get('content')) == norm(opt.get('content')) for o in opts) != 1:
+                return None
+            tags.append(tag_for_option(opt,i))
     return tags if tags else None
 
 def _match_word_to_def(target, opts, word_defs):
     defs = word_defs.get(target)
     if not defs:
-        for bw in word_defs:
-            if target.startswith(bw) or bw.startswith(target):
-                defs = word_defs[bw]; break
-    if not defs:
         return None
-
-    defs_norm = [_norm(d) for d in defs]
-    for i, opt in enumerate(opts):
-        ot = _norm(opt.get("content", ""))
-        for dn in defs_norm:
-            if ot == dn or dn in ot or ot in dn:
-                return opt.get("answer_tag", i)
-
-    for i, opt in enumerate(opts):
-        ot = opt.get("content", "")
-        for d in defs:
-            core = re.sub(r'^[a-z]+\.\s*', '', d)
-            kws = [kw.strip() for kw in re.split(r'[；;，,]', core) if len(kw.strip()) >= 2]
-            for kw in kws:
-                if kw in ot:
-                    return opt.get("answer_tag", i)
-    return None
+    defs_norm = {_norm(d) for d in defs}
+    matches = [tag_for_option(opt,i) for i,opt in enumerate(opts) if _norm(opt.get('content')) in defs_norm]
+    return matches[0] if len(matches) == 1 else None
 
 def _match_mode32(stem, remark, opts, word_defs):
     if not remark: return None
@@ -444,10 +383,109 @@ def _get_topic(resp):
     if isinstance(d, dict) and d.get("topic_code"): return d
     return d.get("topic_info") or d.get("topic") or (d.get("topic_list") or [None])[0]
 
-def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None, list_id=None, task_type=3, grade=2):
-    bank = _bank_load()
+def _valid_answer(topic, answer):
+    if isinstance(answer, list) and not _is_collocation(topic):
+        return False
+    try:
+        encode_answer(topic, answer)
+        return True
+    except BankError:
+        return False
+
+
+def _remember(bank, topic, answer, source, verification='pending', *, complete=True, detail=None):
+    if _valid_answer(topic, answer):
+        # Malformed suggestions cannot be learned; database failures propagate.
+        return bank.record(topic, answer, source, verification, complete=complete, detail=detail)
+    return None
+
+
+def _select_answer(bank, topic, word_defs):
+    hit = bank.lookup(topic)
+    if hit.answer is not None:
+        return hit.answer, hit.source
+    print(f"    [词库未命中] {hit.reason}")
+    for source, provider in [('规则', _match_answer), ('LLM', _llm_answer)]:
+        if source == 'LLM':
+            print('    [LLM回退] 词库未命中，规则未提供可用答案')
+        answer = provider(topic, word_defs)
+        if _is_collocation(topic) and answer is not None and not isinstance(answer, list):
+            answer = [answer]
+        if answer is not None and _valid_answer(topic, answer) and not bank.is_rejected(topic, answer):
+            return answer, source
+    opts = topic.get('options') or []
+    answer = tag_for_option(opts[0], 0) if opts else 0
+    if _is_collocation(topic):
+        answer = [answer]
+    return answer, '猜测'
+
+
+def _verification_data(response):
+    if not isinstance(response, dict) or response.get('code') not in (None, 1):
+        return {}
+    data = response.get('data')
+    return data if isinstance(data, dict) else {}
+
+
+def _flag(data, name, value):
+    return type(data.get(name)) is int and data[name] == value
+
+
+def _next_code(data, previous):
+    code = data.get('topic_code')
+    return code if isinstance(code, (str, int)) and not isinstance(code, bool) and code else previous
+
+
+def _corrections(topic, data):
+    raw = data.get('answer_corrects')
+    if not isinstance(raw, (list, str)) or not raw:
+        return []
+    opts = topic.get('options') or []
+    if topic.get('topic_mode') == 32:
+        if isinstance(raw, str):
+            candidates = [raw]
+        elif all(isinstance(x, str) for x in raw):
+            candidates = [','.join(raw)]
+        elif all(type(x) is int for x in raw):
+            words = []
+            for tag in raw:
+                matches = [o for i,o in enumerate(opts) if str(tag_for_option(o,i)) == str(tag)]
+                if len(matches) != 1:
+                    return []
+                words.append(matches[0].get('content',''))
+            candidates = [','.join(words)]
+        else:
+            return []
+    elif opts:
+        if not isinstance(raw, list):
+            return []
+        tags = []
+        for item in raw:
+            if type(item) not in (str, int):
+                return []
+            matches = [tag_for_option(o,i) for i,o in enumerate(opts) if str(tag_for_option(o,i)) == str(item)]
+            if len(matches) != 1:
+                return []
+            if matches[0] not in tags:
+                tags.append(matches[0])
+        candidates = [tags] if _is_collocation(topic) else tags
+    else:
+        candidates = [raw] if isinstance(raw, str) else raw
+        if not all(isinstance(x,str) for x in candidates):
+            return []
+    return [answer for answer in candidates if _valid_answer(topic, answer)]
+
+
+def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None, list_id=None, task_type=3, grade=2, bank=None):
+    bank = bank or default_store()
+    with bank.runtime():
+        return _run_quiz(client, task_id, release_id, task_kind, course_id, list_id, task_type, grade, bank)
+
+
+def _run_quiz(client, task_id, release_id, task_kind, course_id, list_id, task_type, grade, bank):
     word_defs = {}
-    print(f"📚 题库 {len(bank)} 条")
+    counts = bank.status()
+    print(f"📚 精确题库 {counts['formal']} 条，临时缓存 {counts['cache']} 条，历史原文 {counts['legacy']} 条")
 
     if task_kind == "study":
         resp = client.study_start_answer(task_id, course_id, list_id, task_type=task_type, grade=grade)
@@ -471,69 +509,59 @@ def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None
         total_now = topic.get("topic_total", total)
 
         if mode == 0:
-            word = stem.strip().lower()
+            word = norm(stem)
             opts = topic.get("options") or []
             defs = [o.get("content", "") for o in opts if o.get("content")]
-            if defs: word_defs[word] = defs
+            if defs:
+                word_defs[word] = list(dict.fromkeys([*word_defs.get(word, []), *defs]))
+                bank.record_definitions(topic)
             print(f"  [{done_now}/{total_now}] 📖 {stem} ({len(defs)}个释义)")
             if task_kind == "study":
                 save = client.study_submit(code, random.randint(500, 1500))
             else:
                 save = client.submit(code, random.randint(500, 1500))
         elif _is_collocation(topic):
-            # 搭配题: 多选, 循环 verify 直到 over_status=1
             opts = topic.get("options") or []
             answer_num = topic.get("answer_num") or 2
-            key = _topic_key(topic)
-
-            # 取候选答案 tag 列表
-            tags = None; src = None
-            if key in bank:
-                cached = bank[key]["ans"]
-                if isinstance(cached, list):
-                    tags = list(cached); src = "cache"
-            if not tags:
-                tags = _match_collocation(remark, opts)
-                if tags: src = "match"
-            if not tags:
-                # 兜底: 让 LLM 选; 然后只取一个, 后面靠服务器纠错补齐
-                a_one = _llm_answer(topic, word_defs)
-                if isinstance(a_one, int):
-                    tags = [a_one]; src = "llm"
-            if not tags:
-                tags = [0]; src = "guess"
-
-            chosen, save, ok_tags = [], None, []
+            tags, src = _select_answer(bank, topic, word_defs)
+            _remember(bank, topic, tags, src, complete=False)
+            queue = list(tags[:answer_num])
+            chosen, ok_tags = [], []
             cur_code = code
-            for ans_tag in tags[:answer_num]:
-                if ans_tag in chosen: continue
+            complete = False
+            while queue:
+                ans_tag = queue.pop(0)
+                if ans_tag in chosen:
+                    continue
                 if task_kind == "study":
                     vr = client.study_verify(cur_code, ans_tag)
                 else:
                     vr = client.verify(cur_code, ans_tag)
-                vd = vr.get("data") or {}
-                cur_code = vd.get("topic_code", cur_code)
-                if vd.get("answer_result") == 1:
+                vd = _verification_data(vr)
+                cur_code = _next_code(vd, cur_code)
+                if _flag(vd, 'answer_result', 1):
                     ok_tags.append(ans_tag)
+                elif _flag(vd, 'answer_result', 0) and _valid_answer(topic, tags):
+                    bank.reject(topic, tags, detail={'failed_tag':ans_tag})
                 chosen.append(ans_tag)
-                # 如果服务端给出 corrects, 用它
-                cs = vd.get("answer_corrects") or []
-                if cs:
-                    for c in cs:
-                        if c not in chosen and c not in ok_tags:
-                            ok_tags.append(c)
-                if vd.get("over_status") == 1:
+                for corrected in _corrections(topic, vd):
+                    _remember(bank, topic, corrected, '服务器纠错', complete=False)
+                    queue.extend(t for t in corrected if t not in chosen and t not in queue)
+                if _flag(vd, 'over_status', 1):
+                    complete = len(ok_tags) == answer_num
+                    break
+                if not vd or len(chosen) >= len(opts):
                     break
                 _sleep(0.5, 1.0)
-
-            # 缓存正确答案
             if ok_tags:
-                bank[key] = {"ans": ok_tags, "stem": stem}
-                _bank_save(bank)
+                _remember(bank, topic, ok_tags, src, 'confirmed' if complete else 'pending', complete=complete,
+                          detail={'fully_verified':complete, 'verified_tags':ok_tags})
 
             disp = ",".join(_disp_answer(opts, t, mode) for t in (ok_tags or chosen))
-            tag = "✅" if ok_tags else "⚠️"
+            tag = "✅" if complete else "⚠️"
             print(f"  [{done_now}/{total_now}] {tag} 🔗 {stem} → {disp} [{src}]")
+            if not complete:
+                print('    [待验证] 多选答案集合未完整验证，不能入库')
 
             spent = random.randint(2000, 4000)
             if task_kind == "study":
@@ -541,51 +569,32 @@ def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None
             else:
                 save = client.submit(cur_code, spent)
         else:
-            key = _topic_key(topic)
             opts = topic.get("options") or []
-            answer = None; src = None
-
-            # 1. 题库缓存
-            if key in bank:
-                answer = bank[key]["ans"]; src = "cache"
-
-            # 2. 规则匹配
-            if answer is None:
-                answer = _match_answer(topic, word_defs)
-                if answer is not None: src = "match"
-
-            # 3. LLM 兜底
-            if answer is None:
-                answer = _llm_answer(topic, word_defs)
-                if answer is not None: src = "llm"
-
-            # 4. 实在不行盲猜
-            if answer is None:
-                answer = 0; src = "guess"
+            answer, src = _select_answer(bank, topic, word_defs)
+            _remember(bank, topic, answer, src)
 
             # Verify
             if task_kind == "study":
                 vr = client.study_verify(code, answer)
             else:
                 vr = client.verify(code, answer)
-            vd = vr.get("data") or {}
-            code = vd.get("topic_code", code)
-            ar = vd.get("answer_result")
+            vd = _verification_data(vr)
+            code = _next_code(vd, code)
 
-            if ar == 1:
-                if key not in bank:
-                    bank[key] = {"ans": answer, "stem": stem}
-                    _bank_save(bank)
+            if _flag(vd, 'answer_result', 1):
+                _remember(bank, topic, answer, src, 'confirmed')
                 disp = _disp_answer(opts, answer, mode)
                 print(f"  [{done_now}/{total_now}] ✅ {_disp_stem(stem, remark)} → {disp} [{src}]")
             else:
-                corrects = vd.get("answer_corrects") or []
+                if _flag(vd, 'answer_result', 0) and _valid_answer(topic, answer):
+                    bank.reject(topic, answer)
+                corrects = _corrections(topic, vd)
+                for corrected in corrects:
+                    _remember(bank, topic, corrected, '服务器纠错')
                 if corrects:
-                    answer = corrects[0]
-                    bank[key] = {"ans": answer, "stem": stem}
-                    _bank_save(bank)
+                    print('    [待验证] 服务器纠错已保存，后续验证成功才能入库')
                 disp = _disp_answer(opts, answer, mode)
-                print(f"  [{done_now}/{total_now}] ⚠️ {_disp_stem(stem, remark)} → {disp} [{src}→fix]")
+                print(f"  [{done_now}/{total_now}] ⚠️ {_disp_stem(stem, remark)} → {disp} [{src}，未确认]")
 
             spent = random.randint(2000, 4000)
             if task_kind == "study":
@@ -599,7 +608,8 @@ def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None
         total = sd.get("topic_total", total)
 
         if not next_t or not next_t.get("topic_code") or next_t.get("topic_code") == topic["topic_code"]:
-            print(f"🎉 全部完成 {done}/{total}, 题库 {len(bank)} 条, 词典 {len(word_defs)} 词")
+            counts = bank.status()
+            print(f"🎉 全部完成 {done}/{total}, 精确题库 {counts['formal']} 条, 临时缓存 {counts['cache']} 条, 本轮释义 {len(word_defs)} 词")
             return
 
         topic = next_t
@@ -615,11 +625,12 @@ def _disp_stem(stem, remark):
 def _disp_answer(opts, answer, mode):
     if mode == 32 and isinstance(answer, str):
         return answer[:30]
-    if isinstance(answer, int) and 0 <= answer < len(opts):
-        return opts[answer].get("content", "?")[:30]
+    matches = [opt for i,opt in enumerate(opts) if str(tag_for_option(opt,i)) == str(answer)]
+    if len(matches) == 1:
+        return matches[0].get('content','?')[:30]
     return str(answer)[:30]
 
-def run_full(client, task_id=None, release_id=None, task_index=0, max_score=10):
+def run_full(client, task_id=None, release_id=None, task_index=0, max_score=10, bank=None):
     if task_id is None or release_id is None:
         resp = client.page_task()
         recs = (resp.get("data") or {}).get("records") or []
@@ -649,7 +660,7 @@ def run_full(client, task_id=None, release_id=None, task_index=0, max_score=10):
     else:
         print("全部满分, 跳过选词")
 
-    run_quiz(client, task_id, release_id)
+    run_quiz(client, task_id, release_id, bank=bank)
 
     _sleep(0.5, 1.0)
     sr = client.signin()
@@ -657,7 +668,7 @@ def run_full(client, task_id=None, release_id=None, task_index=0, max_score=10):
     if sd:
         print(f"🏆 签到完成, 累计{sd.get('sign_in_total')}天, 积分+{sd.get('integral')}")
 
-def run_study_full(client, task_id=None, course_id="CET4_v2", list_id=None, task_type=3, grade=2, task_index=0, max_score=10):
+def run_study_full(client, task_id=None, course_id="CET4_v2", list_id=None, task_type=3, grade=2, task_index=0, max_score=10, bank=None):
     try:
         grade = int(grade)
     except (TypeError, ValueError):
@@ -729,7 +740,7 @@ def run_study_full(client, task_id=None, course_id="CET4_v2", list_id=None, task
     else:
         print("全部满分, 跳过选词")
 
-    run_quiz(client, task_id=task_id, task_kind="study", course_id=course_id, list_id=list_id, task_type=task_type, grade=grade)
+    run_quiz(client, task_id=task_id, task_kind="study", course_id=course_id, list_id=list_id, task_type=task_type, grade=grade, bank=bank)
 
     _sleep(0.5, 1.0)
     sr = client.signin()
@@ -749,7 +760,9 @@ def main():
         auth_v=config["AUTH_V"],
         ua=config.get("USER_AGENT", ""),
     )
-    run_full(client)
+    bank = prepare_default_store()
+    with bank.runtime():
+        run_full(client, bank=bank)
 
 
 if __name__ == "__main__":
