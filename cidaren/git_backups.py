@@ -71,6 +71,8 @@ def _upload_excluded(name):
     parts = PurePosixPath(name).parts
     base = parts[-1].casefold()
     return (_excluded(name) or name.casefold() in PRIVATE_SCREENSHOTS
+            or name.casefold().startswith('tests/')
+            or name.casefold() == 'cidaren/test_config.py'
             or base.startswith('.env') and base != '.env.example'
             or any(p.casefold().endswith('.egg-info') for p in parts)
             or base.startswith('.coverage')
