@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.env.local
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+
+# runtime data
+cidaren/bank.json.lock
+cidaren-server*.log
+.capture/
