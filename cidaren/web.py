@@ -6,6 +6,7 @@
 - 支持在前端编辑 token / LLM 配置并同步写入 .env
 """
 import os, sys, subprocess, threading, time, signal, socket, webbrowser
+import hashlib, json
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,8 @@ if __package__ in (None, ""):
     )
     from token_capture import CaptureManager, is_loopback_request
     from bank_store import BankError, prepare_default_store
+    from task_categories import CATEGORY_FIELDS, classify_task
+    from task_safety import SafetyStore, SafetyError
 else:
     from . import a as quiz  # noqa
     from .config import (
@@ -34,17 +37,145 @@ else:
     )
     from .token_capture import CaptureManager, is_loopback_request
     from .bank_store import BankError, prepare_default_store
+    from .task_categories import CATEGORY_FIELDS, classify_task
+    from .task_safety import SafetyStore, SafetyError
 
 app = Flask(__name__)
 
 # ==== 子进程任务状态 ====
-JOBS = {}  # task_id -> {"proc": Popen, "logs": deque, "started": ts, "done": bool}
+JOBS = {}  # 稳定任务键 -> 进程及运行状态
 JOBS_LOCK = threading.RLock()
+JOBS_SEQ = 0
+TASKS_FETCH_LOCK = threading.Lock()
+TASK_CACHE_LOCK = threading.RLock()
+TASK_CACHE = {}
+ACCOUNT_CACHE = {}
+SAFETY = SafetyStore(Path(__file__).resolve().parent.parent)
+RECOVERY_FIELDS = ("recovery_required", "recovery_id", "recovery_reason")
 LOG_MAX = 500
+TASK_METADATA_FIELDS = (
+    "source", "source_label", "task_id", "release_id", "course_id", "list_id", "task_type", "grade",
+    "task_name", "progress", "score", "free", "over_status", "over_time", "start_time", "release_time", "stale", "account_key",
+)
+JOB_STATE_FIELDS = (
+    "job_key", "running", "done", "loop", "waiting", "active", "stopped", "status", "has_logs", "exit_code", "round",
+    *RECOVERY_FIELDS,
+    "account_current",
+)
 
 
-def _job_key(source, task_id, release_id):
-    return ((source or "class"), str(task_id), str(release_id))
+def task_metadata(task):
+    return {field: task[field] for field in TASK_METADATA_FIELDS if field in task}
+
+
+def _auth_scope(config):
+    return hashlib.sha256(json.dumps([config.get(k, "") for k in ("USERTOKEN", "ABC", "AUTH_V")]).encode()).hexdigest()
+
+
+def _resolve_account(config, client=None):
+    """从服务器确认身份；Token 只作为本机列表缓存键。"""
+    key = (client or _client(config)).get_account_key()
+    with TASK_CACHE_LOCK:
+        ACCOUNT_CACHE[_auth_scope(config)] = key
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job.get("loop") and job.get("account_key") != key:
+                job["loop"] = False
+                job["cancel_event"].set()
+                job["logs"].append("[loop] 当前账号已改变，停止旧账号的循环")
+                _touch_jobs()
+    return key
+
+
+def _safety_identity(task, account=None):
+    return dict(account_key=account or task.get("account_key"), source=task.get("source") or "class",
+                release_id=task.get("release_id"), course_id=task.get("course_id"),
+                list_id=task.get("list_id") or task.get("release_id"))
+
+
+def _with_recovery(task, account=None, active=False):
+    row = dict(task)
+    fields = dict(recovery_required=False, recovery_id=None, recovery_reason=None)
+    if (account or row.get("account_key")) and not active:
+        try:
+            state = SAFETY.inspect(**_safety_identity(row, account))
+            fields.update(recovery_required=bool(state.get("paused")), recovery_id=state.get("recovery_id"),
+                          recovery_reason=state.get("reason"))
+        except SafetyError as exc:
+            fields.update(recovery_required=True, recovery_reason=str(exc))
+    row.update(fields)
+    if row["recovery_required"]:
+        row.update(can_start=False, can_loop_start=False, repeatable=False)
+    return row
+
+
+def _remote_task(config, source, release_id, course_id=None, list_id=None, client=None):
+    c = client or _client(config)
+    account = _resolve_account(config, c)
+    records = _list_study_tasks(c, course_id) if source == "study" else _list_class_tasks(c)
+    matches = [r for r in records if str(r.get("list_id") if source == "study" else r.get("release_id"))
+               == str(list_id or release_id)]
+    if len(matches) != 1:
+        raise ValueError("服务器未能唯一确认该账号的任务归属，请在官方端核对")
+    if source == "study" and matches[0].get("course_id") not in (None, course_id):
+        raise ValueError("服务器自学词表所属课程与所选任务不符")
+    row = {**task_metadata(matches[0]), "source": source, "source_label": "自学" if source == "study" else "班级",
+           "account_key": account, "release_id": release_id, "stale": False}
+    if source == "study":
+        row.update(course_id=course_id, list_id=list_id or release_id, release_id=list_id or release_id)
+    _refresh_cached_record(config, source, row, course_id)
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if (job.get("account_key") == account and job.get("source") == source
+                    and _safety_identity(job) == _safety_identity(row)):
+                job["task_meta"] = task_metadata(row)
+                job["task_confirmed"] = True
+                _touch_jobs()
+    return classify_task(row)
+
+
+def _stop_changed_auth_loops(previous, current):
+    if _auth_scope(previous) == _auth_scope(current):
+        return
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job.get("loop"):
+                job["loop"] = False
+                job["cancel_event"].set()
+                job["logs"].append("[loop] 鉴权已更换，停止后续循环；刷新账号和任务后可手动启动")
+                _touch_jobs()
+
+
+def _cached_task(config, source, task_id, release_id, course_id=None, list_id=None):
+    key = _job_key(source, task_id, release_id, course_id, list_id)
+    scope = (_auth_scope(config), source, str(course_id or "CET4_v2") if source == "study" else "")
+    with TASK_CACHE_LOCK:
+        for row in TASK_CACHE.get(scope, []):
+            if _job_key(row.get("source"), row.get("task_id"), row.get("release_id"), row.get("course_id"), row.get("list_id")) == key:
+                return _with_recovery(classify_task(row))
+    return None
+
+
+def _refresh_cached_record(config, source, record, course_id=None):
+    """A loop's existing score request also refreshes eligibility; no extra network request."""
+    scope = (_auth_scope(config), source, str(course_id or "CET4_v2") if source == "study" else "")
+    release_id = record.get("list_id") if source == "study" else record.get("release_id")
+    key = _job_key(source, record.get("task_id"), release_id, course_id, record.get("list_id"))
+    with TASK_CACHE_LOCK:
+        rows = TASK_CACHE.get(scope, [])
+        for index, row in enumerate(rows):
+            if _job_key(source, row.get("task_id"), row.get("release_id"), row.get("course_id"), row.get("list_id")) == key:
+                rows[index] = classify_task({**task_metadata(row), **task_metadata(record), "source": source, "stale": False})
+                break
+
+
+def _job_key(source, task_id, release_id, course_id=None, list_id=None, account_key=None):
+    source = source or "class"
+    if source == "study":
+        key = (source, str(course_id or "CET4_v2"), str(list_id or release_id))
+    else:
+        key = (source, str(task_id), str(release_id))
+    return (*key, account_key) if account_key else key
 
 
 def _int_or_default(value, default):
@@ -54,14 +185,122 @@ def _int_or_default(value, default):
         return default
 
 
-def _find_job(source, task_id, release_id):
-    job = JOBS.get(_job_key(source, task_id, release_id))
-    if job or source != "study":
-        return job
-    for (job_source, _job_task_id, job_release_id), candidate in JOBS.items():
-        if job_source == "study" and job_release_id == str(release_id):
-            return candidate
-    return None
+def _score_full(score):
+    try:
+        return float(score) >= 100
+    except (TypeError, ValueError):
+        return False
+
+
+def _find_job(source, task_id, release_id, course_id=None, list_id=None, account_key=None):
+    with JOBS_LOCK:
+        key = _job_key(source, task_id, release_id, course_id, list_id, account_key)
+        job = JOBS.get(key)
+        if job or account_key:
+            return job
+        matches = [job for identity, job in JOBS.items() if identity[:3] == key]
+        return matches[0] if len(matches) == 1 else None
+
+
+def _touch_jobs():
+    """只在 JOBS_LOCK 内调用；浏览器用代次拒绝旧状态。"""
+    global JOBS_SEQ
+    JOBS_SEQ += 1
+
+
+def _job_active(job):
+    return bool(job and (not job.get("done") or (job.get("loop") and not job.get("stopped"))))
+
+
+def _job_snapshot(job):
+    """只返回公开状态；调用方持有 JOBS_LOCK。"""
+    running = not job["done"]
+    waiting = bool(job["done"] and job.get("loop") and not job.get("stopped"))
+    if running:
+        status = "stopping" if job.get("stopped") else "running"
+    elif waiting:
+        status = "waiting"
+    elif job.get("stopped"):
+        status = "stopped"
+    elif job.get("exit_code") not in (None, 0):
+        status = "failed"
+    else:
+        status = "completed"
+    key = _job_key(job["source"], job["task_id"], job["release_id"], job.get("course_id"), job.get("list_id"), job.get("account_key"))
+    state = {
+        "job_key": json.dumps(key, ensure_ascii=False, separators=(",", ":")),
+        "source": job["source"], "source_label": "自学" if job["source"] == "study" else "班级",
+        "task_id": job["task_id"], "release_id": job["release_id"],
+        "course_id": job.get("course_id"), "list_id": job.get("list_id"),
+        "task_type": job.get("task_type"), "grade": job.get("grade"),
+        "account_key": job.get("account_key"),
+        "account_current": True,
+        "task_name": job.get("task_name") or f"任务 {job['task_id']}",
+        "running": running, "done": job["done"],
+        "loop": bool(job.get("loop")), "waiting": waiting, "active": _job_active(job),
+        "stopped": bool(job.get("stopped")), "status": status, "has_logs": True,
+        "exit_code": job.get("exit_code"), "round": job.get("round", 1),
+    }
+    metadata = job.get("task_meta")
+    eligibility = classify_task(metadata or state)
+    state.update({field: eligibility[field] for field in CATEGORY_FIELDS})
+    with TASK_CACHE_LOCK:
+        current_account = ACCOUNT_CACHE.get(_auth_scope(get_runtime_config()))
+    if current_account and current_account != job.get("account_key"):
+        state.update(account_current=False, can_start=False, can_loop_start=False,
+                     category="unknown", category_label="待确认", category_reason="旧账号任务，仅保留停止和日志；切回该账号后刷新",
+                     eligibility_reason="当前账号与此任务账号不符", source_label="旧账号 · " + state["source_label"])
+    if job.get("account_snapshot") != state["account_current"]:
+        job["account_snapshot"] = state["account_current"]
+        _touch_jobs()
+    if job.get("task_confirmed") is False:
+        reason = "远端列表中未确认该任务，保留本机控制和日志；请刷新任务列表"
+        state.update(category="unknown", category_label="待确认", category_reason=reason,
+                     eligibility_reason=reason, can_start=False, can_loop_start=False, repeatable=False)
+    if metadata:
+        for field in ("score", "progress"):
+            if field in metadata:
+                state[field] = metadata[field]
+    state = _with_recovery(state, job.get("account_key"), active=running)
+    recovery = tuple(state[field] for field in RECOVERY_FIELDS)
+    if job.get("recovery_snapshot") != recovery:
+        job["recovery_snapshot"] = recovery
+        _touch_jobs()
+    if state["recovery_required"]:
+        state["status"] = "recovery_required"
+    return state
+
+
+def _merge_jobs(tasks):
+    """远端列表缺失时保留本机任务；状态始终取锁内最新快照。"""
+    rows = {}
+    for task in tasks:
+        key = _job_key(task.get("source"), task.get("task_id"), task.get("release_id"), task.get("course_id"), task.get("list_id"), task.get("account_key"))
+        rows[key] = {**_with_recovery(classify_task(task)), "job_key": json.dumps(key, ensure_ascii=False, separators=(",", ":")),
+                     "running": False, "done": False, "loop": False, "waiting": False,
+                     "active": False, "stopped": False, "status": "idle", "has_logs": False,
+                     "exit_code": None, "round": 0, "account_current": True}
+        if rows[key]["recovery_required"]:
+            rows[key].update(status="recovery_required", has_logs=True)
+    with JOBS_LOCK:
+        for key, job in JOBS.items():
+            state = _job_snapshot(job)
+            if key in rows:
+                same_account = rows[key].get("account_key") == job.get("account_key")
+                rows[key].update({field: state[field] for field in JOB_STATE_FIELDS if same_account or field not in RECOVERY_FIELDS})
+                if not same_account:
+                    continue
+                metadata = task_metadata(rows[key])
+                if job.get("task_meta") != metadata or job.get("task_confirmed") is False:
+                    job["task_meta"] = metadata
+                    job["task_confirmed"] = True
+                    _touch_jobs()
+            else:
+                if job.get("task_confirmed") is not False:
+                    job["task_confirmed"] = False
+                    _touch_jobs()
+                rows[key] = _job_snapshot(job)
+        return list(rows.values())
 
 
 def _client(config=None):
@@ -80,10 +319,7 @@ def _client(config=None):
 def _has_active_jobs():
     """包括正在执行以及循环模式等待重启的任务。"""
     with JOBS_LOCK:
-        return any(
-            not job.get("stopped") and (not job.get("done") or job.get("loop"))
-            for job in JOBS.values()
-        )
+        return any(_job_active(job) for job in JOBS.values())
 
 
 def _validate_captured_credentials(credentials):
@@ -123,7 +359,9 @@ def _list_class_tasks(c):
     out, page = [], 1
     while True:
         resp = c.page_task(page=page, size=50)
-        recs = (resp.get("data") or {}).get("records") or []
+        recs = quiz._task_data(resp, "读取班级任务列表", allow_empty=True).get("records") or []
+        if not isinstance(recs, list) or any(not isinstance(row, dict) for row in recs):
+            raise ValueError("班级任务列表格式错误")
         if not recs:
             break
         out.extend(recs)
@@ -138,130 +376,166 @@ def _list_class_tasks(c):
 def _list_study_tasks(c, course_id):
     """拉取自学任务。"""
     resp = c.study_task_list(course_id=course_id)
-    data = resp.get("data") or {}
-    return data.get("task_list") or []
+    data = quiz._task_data(resp, "读取自学任务列表", allow_empty=True)
+    tasks = data.get("task_list") or []
+    if not isinstance(tasks, list) or any(not isinstance(row, dict) for row in tasks):
+        raise ValueError("自学任务列表格式错误")
+    return tasks
 
 
 def _list_tasks():
-    """拉取班级任务 + 自学任务。"""
+    """串行拉取远端列表；单个来源失败时保留上次成功结果。"""
     cfg = get_runtime_config()
     c = _client(cfg)
+    account = _resolve_account(cfg, c)
     course_id = (cfg.get("COURSE_ID") or "CET4_v2").strip() or "CET4_v2"
     study_grade = _int_or_default(cfg.get("STUDY_GRADE"), 2)
+    auth_scope = _auth_scope(cfg)
     out, warnings = [], []
-
-    try:
-        for r in _list_class_tasks(c):
-            tid = r.get("task_id")
-            rid = r.get("release_id")
-            job = _find_job("class", tid, rid)
-            out.append({
-                "source": "class",
-                "source_label": "班级",
-                "can_start": True,
-                "task_id": tid,
-                "release_id": rid,
-                "task_name": r.get("task_name"),
-                "progress": r.get("progress"),
-                "score": r.get("score"),
-                "running": bool(job and not job["done"]),
-                "done": bool(job and job["done"]),
-                "exit_code": job["exit_code"] if job else None,
-                "loop": bool(job and job.get("loop")),
-                "round": job.get("round", 0) if job else 0,
-            })
-    except Exception as e:
-        warnings.append(f"班级任务读取失败: {e}")
-
-    try:
-        for r in _list_study_tasks(c, course_id):
-            tid = r.get("task_id")
-            rid = r.get("list_id")
-            job = _find_job("study", tid, rid)
-            out.append({
-                "source": "study",
-                "source_label": "自学",
-                "can_start": True,
-                "task_id": tid,
-                "release_id": rid,
-                "course_id": r.get("course_id") or course_id,
-                "list_id": rid,
-                "task_type": r.get("task_type"),
-                "grade": _int_or_default(r.get("grade"), study_grade),
-                "task_name": r.get("task_name"),
-                "progress": r.get("progress"),
-                "score": r.get("score"),
-                "running": bool(job and not job["done"]),
-                "done": bool(job and job["done"]),
-                "exit_code": job["exit_code"] if job else None,
-                "loop": bool(job and job.get("loop")),
-                "round": job.get("round", 0) if job else 0,
-            })
-    except Exception as e:
-        warnings.append(f"自学任务读取失败: {e}")
-
+    with TASKS_FETCH_LOCK:
+        for source, label, course in (("class", "班级", ""), ("study", "自学", course_id)):
+            cache_key = (auth_scope, source, course)
+            try:
+                records = _list_class_tasks(c) if source == "class" else _list_study_tasks(c, course)
+                rows = []
+                for r in records:
+                    rid = r.get("release_id") if source == "class" else r.get("list_id")
+                    row = {"source": source, "source_label": label, "can_start": rid is not None, "account_key": account,
+                           "task_id": r.get("task_id") or 0, "release_id": rid,
+                           "task_name": r.get("task_name"), "progress": r.get("progress"), "score": r.get("score")}
+                    for field in ("task_type", "free", "over_status", "over_time", "start_time", "release_time"):
+                        if field in r:
+                            row[field] = r[field]
+                    if source == "study":
+                        row.update(course_id=r.get("course_id") or course, list_id=rid,
+                                   task_type=r.get("task_type"), grade=_int_or_default(r.get("grade"), study_grade))
+                    rows.append(classify_task(row))
+                with TASK_CACHE_LOCK:
+                    TASK_CACHE[cache_key] = rows
+                out.extend(_with_recovery(row) for row in rows)
+            except Exception as exc:
+                warnings.append(f"{label}任务读取失败，已保留上次列表及本机任务: {exc}")
+                with TASK_CACHE_LOCK:
+                    out.extend(_with_recovery(classify_task({**row, "stale": True})) for row in TASK_CACHE.get(cache_key, []))
     return out, warnings
 
 
-def _reader_thread(job_id, proc):
-    """读取子进程 stdout, 写入 ring buffer"""
-    job = JOBS[job_id]
+def _reader_thread(job_id, proc, job=None):
+    """绑定本轮对象，旧线程不能修改或重启后来替换的任务。"""
+    with JOBS_LOCK:
+        job = job or JOBS[job_id]
     for line in iter(proc.stdout.readline, b""):
         try:
             text = line.decode("utf-8", errors="replace").rstrip()
         except Exception:
             text = repr(line)
-        job["logs"].append(text)
+        with JOBS_LOCK:
+            if JOBS.get(job_id) is job:
+                job["logs"].append(text)
+                if text == quiz.NO_PENDING_WORDS_MESSAGE:
+                    job["no_pending_words"] = True
     proc.wait()
-    job["done"] = True
-    job["exit_code"] = proc.returncode
+    with JOBS_LOCK:
+        if JOBS.get(job_id) is not job:
+            return
+        job["done"] = True
+        job["exit_code"] = proc.returncode
+        _touch_jobs()
+        if proc.returncode != 0:
+            job["loop"] = False
+            job["logs"].append("[loop] 本轮异常退出，已停止循环；结果不明时须在官方端核对后重新同步")
+            _touch_jobs()
+            return
+        if proc.returncode == 0 and job.get("loop") and job.get("no_pending_words"):
+            job["loop"] = False
+            job["logs"].append("[loop] 单词已满分，停止循环")
+            return
+        if not job.get("loop") or job.get("stopped"):
+            return
 
     # 循环模式: 如果未满分则重新启动
     if job.get("loop") and not job.get("stopped"):
         try:
-            score = _query_score(job["source"], job["task_id"], job["release_id"], job.get("course_id"), job.get("list_id"))
+            score = _query_score(job["source"], job["task_id"], job["release_id"], job.get("course_id"), job.get("list_id"), job.get("account_key"))
         except Exception as e:
-            job["logs"].append(f"[loop] 查询分数失败: {e}")
-            score = None
-        if score is not None and score >= 100:
-            job["logs"].append(f"[loop] 已满分 ({score}), 停止循环")
-            return
-        job["logs"].append(f"[loop] 当前分数={score}, 5s 后重新启动...")
-        time.sleep(5)
-        if job.get("stopped"):
+            with JOBS_LOCK:
+                if JOBS.get(job_id) is job:
+                    job["logs"].append(f"[loop] 查询分数失败: {e}")
+                    job["loop"] = False
+                    _touch_jobs()
             return
         with JOBS_LOCK:
-            _spawn_job(
-                job["source"],
-                job["task_id"],
-                job["release_id"],
-                loop=True,
-                course_id=job.get("course_id"),
-                list_id=job.get("list_id"),
-                task_type=job.get("task_type"),
-                grade=job.get("grade"),
-            )
+            if JOBS.get(job_id) is not job or job.get("stopped") or not job.get("loop"):
+                return
+            config = get_runtime_config()
+            eligibility = _cached_task(config, job["source"], job["task_id"], job["release_id"], job.get("course_id"), job.get("list_id"))
+            if eligibility:
+                job["task_meta"] = task_metadata(eligibility)
+            if score is None:
+                job["loop"] = False
+                job["logs"].append("[loop] 服务器未返回当前任务分数，停止循环；请刷新后核对")
+                _touch_jobs()
+                return
+            if _score_full(score):
+                job["loop"] = False
+                job["logs"].append(f"[loop] 已满分 ({score}), 停止循环")
+                _touch_jobs()
+                return
+            if not eligibility or not eligibility["can_loop_start"]:
+                job["loop"] = False
+                job["logs"].append("[loop] 停止循环: " + (eligibility["category_reason"] if eligibility else "当前鉴权下无法确认任务资格，请刷新列表"))
+                _touch_jobs()
+                return
+            job["logs"].append(f"[loop] 当前分数={score}, 5s 后重新启动...")
+        if job["cancel_event"].wait(5):
+            return
+        with JOBS_LOCK:
+            if JOBS.get(job_id) is not job or job.get("stopped") or not job.get("loop"):
+                return
+            config = get_runtime_config()
+            eligibility = _cached_task(config, job["source"], job["task_id"], job["release_id"], job.get("course_id"), job.get("list_id"))
+            if not eligibility or not eligibility["can_loop_start"]:
+                job["loop"] = False
+                job["logs"].append("[loop] 重启前任务资格已变化，停止循环: " + (eligibility["category_reason"] if eligibility else "请刷新任务列表"))
+                _touch_jobs()
+                return
+            try:
+                _spawn_job(job["source"], eligibility["task_id"], job["release_id"], loop=True, config=config,
+                           course_id=job.get("course_id"), list_id=job.get("list_id"),
+                           task_type=job.get("task_type"), grade=job.get("grade"),
+                           task_name=job.get("task_name"), task_meta=eligibility, expected_job=job)
+            except Exception as exc:
+                job["loop"] = False
+                job["exit_code"] = 1
+                job["logs"].append(f"[loop] 无法重新启动，已停止循环: {exc}")
+                _touch_jobs()
 
 
-def _query_score(source, task_id, release_id, course_id=None, list_id=None):
+def _query_score(source, task_id, release_id, course_id=None, list_id=None, expected_account=None):
     """轻量查询单个任务当前分数"""
-    c = _client()
+    config = get_runtime_config()
+    c = _client(config)
+    account = _resolve_account(config, c)
+    if expected_account and account != expected_account:
+        raise ValueError("当前账号已改变，不能继续旧账号的任务")
     if source == "study":
         resp = c.study_task_list(course_id=course_id or "CET4_v2")
-        recs = (resp.get("data") or {}).get("task_list") or []
+        recs = quiz._task_data(resp, "读取自学分数").get("task_list") or []
         for r in recs:
-            if str(r.get("list_id")) == str(list_id or release_id) or str(r.get("task_id")) == str(task_id):
+            if str(r.get("list_id")) == str(list_id or release_id):
+                _refresh_cached_record(config, source, r, course_id)
                 return r.get("score")
         return None
 
     page = 1
     while page <= 20:
         resp = c.page_task(page=page, size=50)
-        recs = (resp.get("data") or {}).get("records") or []
+        recs = quiz._task_data(resp, "读取班级分数").get("records") or []
         if not recs:
             return None
         for r in recs:
-            if r.get("task_id") == task_id and r.get("release_id") == release_id:
+            if str(r.get("task_id")) == str(task_id) and str(r.get("release_id")) == str(release_id):
+                _refresh_cached_record(config, source, r)
                 return r.get("score")
         if len(recs) < 50:
             return None
@@ -269,25 +543,49 @@ def _query_score(source, task_id, release_id, course_id=None, list_id=None):
     return None
 
 
-def _spawn_job(source, task_id, release_id, loop=False, config=None, course_id=None, list_id=None, task_type=None, grade=None):
+def _spawn_job(source, task_id, release_id, loop=False, config=None, course_id=None, list_id=None, task_type=None, grade=None, task_name=None, expected_job=None, task_meta=None):
+    with JOBS_LOCK:
+        return _spawn_job_locked(source, task_id, release_id, loop, config, course_id, list_id, task_type, grade, task_name, expected_job, task_meta)
+
+
+def _spawn_job_locked(source, task_id, release_id, loop, config, course_id, list_id, task_type, grade, task_name, expected_job, task_meta):
     """启动子进程跑一个 task, 配置通过环境变量透传给 runner。"""
+    course_id = (course_id or "CET4_v2") if source == "study" else None
+    list_id = (list_id or release_id) if source == "study" else None
+    key = _job_key(source, task_id, release_id, course_id, list_id, (task_meta or {}).get("account_key"))
+    old = JOBS.get(key)
+    if expected_job is not None:
+        if old is not expected_job or old.get("stopped") or not old.get("loop") or not old.get("done"):
+            raise ValueError("任务状态已变化，取消旧循环重启")
+    elif _job_active(old):
+        raise ValueError("任务正在运行或等待循环重启")
+    account = (task_meta or {}).get("account_key")
+    if not account:
+        raise ValueError("账号尚未由服务器确认，请刷新任务列表")
+    if expected_job and account != expected_job.get("account_key"):
+        raise ValueError("当前账号已改变，取消旧账号的循环")
+    checked = _with_recovery(task_meta, account)
+    if checked["recovery_required"]:
+        raise SafetyError(checked["recovery_reason"] or "提交状态需核对")
     if source == "study":
         args = ["study", str(task_id), str(list_id or release_id), str(course_id or "CET4_v2"), str(task_type or 3), str(grade or 2)]
     else:
         args = ["class", str(task_id), str(release_id)]
+    environment = build_subprocess_env(config)
+    environment["CIDAREN_TASK_ACCOUNT_KEY"] = account
     proc = subprocess.Popen(
         [sys.executable, "-u", "-m", "cidaren._runner", *args],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=1,
-        env=build_subprocess_env(config),
+        env=environment,
     )
     # 保留旧的 logs (循环模式下追加)
-    key = _job_key(source, task_id, release_id)
-    old = JOBS.get(key)
+    if old and old.get("account_key") != account:
+        old = None
     logs = old["logs"] if old else deque(maxlen=LOG_MAX)
     if old:
         logs.append(f"========== 第 {old.get('round', 1) + 1} 轮启动 ==========")
-    JOBS[key] = {
+    job = {
         "proc": proc,
         "logs": logs,
         "started": time.time(),
@@ -299,19 +597,34 @@ def _spawn_job(source, task_id, release_id, loop=False, config=None, course_id=N
         "course_id": course_id,
         "list_id": list_id,
         "task_type": task_type,
+        "account_key": account,
         "grade": grade,
+        "task_name": task_name or (old.get("task_name") if old else None),
+        "task_meta": task_metadata(task_meta) if task_meta else (old.get("task_meta") if old else None),
+        "task_confirmed": task_meta is not None,
         "loop": loop,
         "stopped": False,
+        "no_pending_words": False,
+        "cancel_event": threading.Event(),
         "round": (old.get("round", 1) + 1) if old else 1,
     }
-    threading.Thread(target=_reader_thread, args=(key, proc), daemon=True).start()
+    JOBS[key] = job
+    _touch_jobs()
+    threading.Thread(target=_reader_thread, args=(key, proc, job), daemon=True).start()
+    return job
 
 
 # ==== Routes ====
 
 @app.route("/")
 def index():
-    return Response(_INDEX_HTML, mimetype="text/html; charset=utf-8")
+    return Response(_INDEX_HTML, mimetype="text/html; charset=utf-8", headers={"Cache-Control": "no-cache"})
+
+
+@app.route("/ui.js")
+def ui_script():
+    return Response(Path(__file__).with_name("web_ui.js").read_text(encoding="utf-8"),
+                    mimetype="application/javascript", headers={"Cache-Control": "no-cache"})
 
 
 @app.route("/api/config")
@@ -328,7 +641,9 @@ def api_config():
 @app.route("/api/config", methods=["POST"])
 def api_save_config():
     body = request.get_json(force=True) or {}
+    previous = get_runtime_config()
     saved = save_runtime_config(body)
+    _stop_changed_auth_loops(previous, saved)
     return jsonify({
         "ok": True,
         "config": saved,
@@ -372,36 +687,95 @@ def api_tasks():
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True, "tasks": tasks, "warnings": warnings})
+    if CAPTURE.is_active():
+        return jsonify({"ok": False, "capturing": True, "error": "正在获取鉴权，任务列表已暂停刷新"}), 409
+    with JOBS_LOCK:
+        return jsonify({"ok": True, "tasks": _merge_jobs(tasks), "warnings": warnings,
+                        "jobs": [_job_snapshot(job) for job in JOBS.values()], "seq": JOBS_SEQ})
+
+
+@app.route("/api/jobs")
+def api_jobs():
+    """本地状态查询，不访问词达人服务器。"""
+    if CAPTURE.is_active():
+        return jsonify({"ok": False, "capturing": True, "error": "正在获取鉴权，任务状态刷新已暂停"}), 409
+    with JOBS_LOCK:
+        return jsonify({"ok": True, "jobs": [_job_snapshot(job) for job in JOBS.values()], "seq": JOBS_SEQ})
+
+
+def _request_task(body, config=None):
+    if not isinstance(body, dict):
+        raise ValueError("任务参数必须是 JSON 对象")
+    source = body.get("source") or "class"
+    if source not in {"class", "study"}:
+        raise ValueError("未知任务来源")
+    try:
+        task_id = int(str(body.get("task_id", 0)))
+        release_id = body.get("release_id")
+        if source == "class":
+            release_id = int(str(release_id))
+    except (TypeError, ValueError):
+        raise ValueError("任务编号格式错误") from None
+    if source == "study" and task_id == -1:
+        task_id = 0
+    if task_id < 0 or (source == "class" and task_id == 0) or release_id in (None, ""):
+        raise ValueError("任务编号不完整")
+    cfg = config or get_runtime_config()
+    course_id = str(body.get("course_id") or cfg.get("COURSE_ID") or "CET4_v2").strip() if source == "study" else None
+    list_id = body.get("list_id") or release_id
+    return source, task_id, release_id, course_id, list_id
 
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
     if CAPTURE.is_active():
         return jsonify({"ok": False, "error": "正在获取鉴权，暂不能启动任务"}), 409
-    body = request.get_json(force=True)
-    source = body.get("source") or "class"
-    task_id = int(body["task_id"])
-    release_id = body["release_id"]
-    if source == "class":
-        release_id = int(release_id)
-    course_id = body.get("course_id")
-    list_id = body.get("list_id") or release_id
-    task_type = int(body.get("task_type") or 3)
+    body = request.get_json(silent=True)
     config = get_runtime_config()
+    try:
+        source, task_id, release_id, course_id, list_id = _request_task(body, config)
+        task_type = int(body.get("task_type") or 3)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     grade = _int_or_default(body.get("grade") or config.get("STUDY_GRADE"), 2)
     loop = bool(body.get("loop", False))
     missing = get_missing_auth_fields(config)
     if missing:
         return jsonify({"ok": False, "error": f"请先填写配置: {', '.join(missing)}"}), 400
+    if not _cached_task(config, source, task_id, release_id, course_id, list_id):
+        return jsonify({"ok": False, "error": "当前任务信息尚未确认，请先刷新任务列表"}), 409
+    try:
+        fresh = _with_recovery(_remote_task(config, source, release_id, course_id, list_id))
+        if body.get("account_key") is not None and body["account_key"] != fresh["account_key"]:
+            raise ValueError("所选任务属于其他账号，请刷新当前账号的任务列表")
+        if source == "class" and str(fresh.get("task_id")) != str(task_id):
+            raise ValueError("服务器任务编号已变化，请刷新后重新选择")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"无法确认账号和任务: {exc}"}), 409
     with JOBS_LOCK:
         if CAPTURE.is_active():
             return jsonify({"ok": False, "error": "正在获取鉴权，暂不能启动任务"}), 409
-        job = _find_job(source, task_id, release_id)
-        if job and not job["done"]:
-            return jsonify({"ok": False, "error": "任务正在运行"}), 400
-        _spawn_job(source, task_id, release_id, loop=loop, config=config, course_id=course_id, list_id=list_id, task_type=task_type, grade=grade)
-    return jsonify({"ok": True})
+        if _auth_scope(config) != _auth_scope(get_runtime_config()):
+            return jsonify({"ok": False, "error": "鉴权已变化，请刷新账号和任务"}), 409
+        eligibility = _with_recovery(fresh)
+        if eligibility["recovery_required"]:
+            return jsonify({"ok": False, "error": eligibility["recovery_reason"] or "提交状态需核对", "task": eligibility}), 409
+        if not eligibility["can_start"] or (loop and not eligibility["can_loop_start"]):
+            return jsonify({"ok": False, "error": eligibility["category_reason"] + ("；不能自动循环" if loop and eligibility["can_start"] else ""),
+                            "task": eligibility}), 409
+        task_id = eligibility["task_id"]
+        task_type = eligibility.get("task_type") or task_type
+        job = _find_job(source, task_id, release_id, course_id, list_id, eligibility.get("account_key"))
+        if _job_active(job):
+            return jsonify({"ok": False, "error": "任务正在运行或等待循环重启",
+                            "job": _job_snapshot(job), "seq": JOBS_SEQ}), 409
+        try:
+            job = _spawn_job(source, task_id, release_id, loop=loop, config=config, course_id=course_id,
+                             list_id=list_id, task_type=task_type, grade=grade,
+                             task_name=eligibility.get("task_name"), task_meta=eligibility)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"无法启动任务: {exc}"}), 500
+        return jsonify({"ok": True, "job": _job_snapshot(job), "seq": JOBS_SEQ})
 
 
 @app.route("/api/start_all", methods=["POST"])
@@ -415,51 +789,127 @@ def api_start_all():
         if missing:
             return jsonify({"ok": False, "error": f"请先填写配置: {', '.join(missing)}"}), 400
         c = _client(config)
+        account = _resolve_account(config, c)
         tasks = _list_class_tasks(c)
+        tasks = [_with_recovery(classify_task({**task_metadata(row), "source": "class", "source_label": "班级", "account_key": account})) for row in tasks]
+        with TASK_CACHE_LOCK:
+            TASK_CACHE[(_auth_scope(config), "class", "")] = tasks
         started = 0
         skipped = 0
         with JOBS_LOCK:
             if CAPTURE.is_active():
                 return jsonify({"ok": False, "error": "正在获取鉴权，暂不能启动任务"}), 409
+            if _auth_scope(config) != _auth_scope(get_runtime_config()):
+                return jsonify({"ok": False, "error": "鉴权已变化，请刷新账号和任务"}), 409
             for r in tasks:
                 tid = r.get("task_id")
                 rid = r.get("release_id")
-                job = _find_job("class", tid, rid)
-                if job and not job["done"]:
+                job = _find_job("class", tid, rid, account_key=account)
+                if _job_active(job):
                     skipped += 1
                     continue
-                if r.get("score") is not None and r.get("score") >= 100:
+                r = _with_recovery(r)
+                if r["category"] != "available" or not r["can_loop_start"]:
                     skipped += 1
                     continue
-                _spawn_job("class", tid, rid, loop=True, config=config)
+                _spawn_job("class", tid, rid, loop=True, config=config, task_name=r.get("task_name"), task_type=r.get("task_type"), task_meta=r)
                 started += 1
-        return jsonify({"ok": True, "started": started, "skipped": skipped})
+            return jsonify({"ok": True, "started": started, "skipped": skipped,
+                            "jobs": [_job_snapshot(job) for job in JOBS.values()], "seq": JOBS_SEQ})
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _recovery_request_allowed():
+    if not is_loopback_request(request.remote_addr, urlparse(request.host_url).hostname):
+        return False
+    origin = urlparse(request.headers.get("Origin", ""))
+    target = urlparse(request.host_url)
+    try:
+        return (origin.scheme in {"http", "https"} and not origin.username and not origin.password
+                and origin.path in {"", "/"} and not origin.query and not origin.fragment
+                and (origin.scheme, origin.hostname, origin.port or (443 if origin.scheme == "https" else 80))
+                == (target.scheme, target.hostname, target.port or (443 if target.scheme == "https" else 80))
+                and request.headers.get("Sec-Fetch-Site") not in {"cross-site", "same-site"}
+                and request.is_json)
+    except ValueError:
+        return False
+
+
+@app.route("/api/tasks/recovery/ack", methods=["POST"])
+def api_recovery_ack():
+    if not _recovery_request_allowed():
+        return jsonify({"ok": False, "error": "仅允许本机同源网页确认恢复"}), 403
+    if CAPTURE.is_active():
+        return jsonify({"ok": False, "error": "正在获取鉴权，暂不能重新同步"}), 409
+    body = request.get_json(silent=True)
+    config = get_runtime_config()
+    try:
+        source, task_id, release_id, course_id, list_id = _request_task(body, config)
+        if body.get("confirmed") is not True or not isinstance(body.get("recovery_id"), str):
+            raise ValueError("请先在官方端核对，并明确确认当前暂停记录")
+        account = _resolve_account(config)
+        if body.get("account_key") != account:
+            raise ValueError("账号身份已变化，保留原账号的暂停记录")
+        with JOBS_LOCK:
+            job = _find_job(source, task_id, release_id, course_id, list_id, account)
+            if _job_active(job):
+                raise ValueError("任务仍在运行，请先停止任务并等待退出")
+            acknowledged_job = job
+        refreshed = None
+
+        def validate():
+            nonlocal refreshed
+            refreshed = _remote_task(config, source, release_id, course_id, list_id)
+            if refreshed["account_key"] != account or _auth_scope(config) != _auth_scope(get_runtime_config()):
+                raise ValueError("重新同步期间账号已变化，暂停保留")
+            if CAPTURE.is_active():
+                raise ValueError("正在获取鉴权，暂停保留")
+            return True
+
+        SAFETY.ack(**_safety_identity({"source": source, "release_id": release_id, "course_id": course_id,
+                                     "list_id": list_id}, account),
+                   expected_recovery_id=body["recovery_id"], validate=validate)
+        with JOBS_LOCK:
+            job = _find_job(source, task_id, release_id, course_id, list_id, account)
+            if job and job is acknowledged_job and job.get("account_key") == account:
+                job["task_meta"] = task_metadata(refreshed)
+                job["loop"] = False
+                job["logs"].append("[recovery] 已人工核对并只读重新同步；未重放请求，需手动启动")
+            _touch_jobs()
+            return jsonify({"ok": True, "task": _with_recovery(refreshed),
+                            "jobs": [_job_snapshot(j) for j in JOBS.values()], "seq": JOBS_SEQ})
+    except (ValueError, SafetyError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"重新同步失败，暂停保留: {exc}"}), 500
+
+
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    body = request.get_json(force=True)
-    source = body.get("source") or "class"
-    task_id = int(body["task_id"])
-    release_id = body["release_id"]
-    if source == "class":
-        release_id = int(release_id)
-    job = _find_job(source, task_id, release_id)
-    if not job:
-        return jsonify({"ok": False, "error": "任务未运行"}), 400
-    # 标记 stopped, 阻断循环重启
-    job["stopped"] = True
-    job["loop"] = False
-    if not job["done"]:
-        try:
-            job["proc"].send_signal(signal.SIGTERM)
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-    return jsonify({"ok": True})
+    body = request.get_json(silent=True)
+    try:
+        source, task_id, release_id, course_id, list_id = _request_task(body)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    with JOBS_LOCK:
+        job = _find_job(source, task_id, release_id, course_id, list_id, body.get("account_key"))
+        if not job:
+            return jsonify({"ok": False, "error": "任务未运行"}), 404
+        job["stopped"] = True
+        job["loop"] = False
+        job["cancel_event"].set()
+        _touch_jobs()
+        if not job["done"]:
+            try:
+                job["proc"].send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass  # 进程恰好退出，由 reader 收尾
+            except Exception as exc:
+                return jsonify({"ok": False, "error": str(exc), "job": _job_snapshot(job), "seq": JOBS_SEQ}), 500
+        return jsonify({"ok": True, "job": _job_snapshot(job), "seq": JOBS_SEQ})
 
 
 @app.route("/api/logs")
@@ -467,28 +917,39 @@ def api_logs_query():
     source = request.args.get("source") or "class"
     task_id = request.args.get("task_id")
     release_id = request.args.get("release_id")
-    job = _find_job(source, task_id, release_id)
-    if not job:
-        return jsonify({"ok": False, "logs": []})
-    return jsonify({
-        "ok": True,
-        "logs": list(job["logs"]),
-        "done": job["done"],
-        "exit_code": job["exit_code"],
-    })
+    course_id = request.args.get("course_id")
+    list_id = request.args.get("list_id")
+    with JOBS_LOCK:
+        job = _find_job(source, task_id, release_id, course_id, list_id, request.args.get("account_key"))
+        task = None if job else _cached_task(get_runtime_config(), source, task_id, release_id, course_id, list_id)
+        if task and request.args.get("account_key") not in (None, task.get("account_key")):
+            task = None
+        return _logs_response(job, task)
 
 
 @app.route("/api/logs/<int:task_id>/<int:release_id>")
 def api_logs(task_id, release_id):
-    job = _find_job("class", task_id, release_id)
+    with JOBS_LOCK:
+        job = _find_job("class", task_id, release_id)
+        task = None if job else _cached_task(get_runtime_config(), "class", task_id, release_id)
+        return _logs_response(job, task)
+
+
+def _logs_response(job, task=None):
     if not job:
-        return jsonify({"ok": False, "logs": []})
-    return jsonify({
-        "ok": True,
-        "logs": list(job["logs"]),
-        "done": job["done"],
-        "exit_code": job["exit_code"],
-    })
+        if task and task.get("recovery_required"):
+            state = {**task, "running": False, "active": False, "waiting": False, "loop": False,
+                     "done": True, "exit_code": 3, "status": "recovery_required", "has_logs": True}
+            return jsonify({"ok": True, "logs": ["⏸ " + (task.get("recovery_reason") or "提交状态需要核对"),
+                            "本次服务没有此前进程的完整日志；暂停来自本机持久记录，请在官方端核对后重新同步。"],
+                            "job": state, "seq": JOBS_SEQ, "done": True, "active": False, "waiting": False,
+                            "loop": False, "stopped": False, "exit_code": 3, "status": "recovery_required"})
+        return jsonify({"ok": False, "logs": [], "error": "本次服务中还没有该任务的日志"}), 404
+    state = _job_snapshot(job)
+    return jsonify({"ok": True, "logs": list(job["logs"]), "job": state, "seq": JOBS_SEQ,
+                    "done": state["done"], "exit_code": state["exit_code"],
+                    "active": state["active"], "waiting": state["waiting"],
+                    "loop": state["loop"], "stopped": state["stopped"], "status": state["status"]})
 
 
 # ==== HTML ====
@@ -545,6 +1006,17 @@ _INDEX_HTML = '''<!doctype html>
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
   .badge.run { background: #fff3cd; color: #856404; }
   .badge.done { background: #d4edda; color: #155724; }
+  .badge.fail { background: #fee4e2; color: #b42318; }
+  .task-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; align-items: center; }
+  .task-filters button.selected { background: #eaf3ff; border-color: #007aff; color: #0059bf; }
+  .task-filters select { padding: 7px 10px; border: 1px solid #d2d2d7; border-radius: 6px; font: inherit; }
+  .filter-summary { color: #667085; font-size: 13px; }
+  .category { display: inline-block; font-size: 11px; border-radius: 6px; padding: 2px 6px; margin-top: 6px; }
+  .category.available { color: #175cd3; background: #eff8ff; }
+  .category.full { color: #027a48; background: #ecfdf3; }
+  .category.blocked { color: #b42318; background: #fef3f2; }
+  .category.unknown { color: #b54708; background: #fffaeb; }
+  .task-reason { color: #667085; font-size: 12px; max-width: 420px; line-height: 1.5; margin-top: 4px; }
   .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 100; }
   .modal.show { display: flex; align-items: center; justify-content: center; }
   .modal-body { background: #1e1e1e; color: #d4d4d4; width: 80vw; height: 75vh; border-radius: 8px;
@@ -659,13 +1131,23 @@ _INDEX_HTML = '''<!doctype html>
           <h2>任务面板</h2>
           <p>启动后会在子进程里执行刷题流程，日志可实时查看。</p>
         </div>
-        <div class="status-box">分数自动每 5 秒刷新</div>
+        <div class="status-box">运行状态实时更新 · 分数每 30 秒刷新</div>
       </div>
       <div class="card-body">
         <div class="bar">
           <button id="refresh-tasks" onclick="loadTasks()">🔄 刷新任务</button>
-          <button id="start-all" class="loop" onclick="startAllClassLoop()">🚀 一键启动全部班级循环</button>
+          <button id="start-all" class="loop" onclick="startAllClassLoop()">🚀 循环启动可继续的班级任务</button>
           <span id="status">加载中...</span>
+        </div>
+        <div class="task-filters" id="task-filters" aria-label="任务分类">
+          <button data-filter="all" class="selected" aria-pressed="true">全部</button>
+          <button data-filter="available" aria-pressed="false">未完成可继续</button>
+          <button data-filter="full" aria-pressed="false">已满分</button>
+          <button data-filter="blocked" aria-pressed="false">不可执行</button>
+          <button data-filter="unknown" aria-pressed="false">待确认</button>
+          <label for="source-filter">来源</label>
+          <select id="source-filter"><option value="all">全部来源</option><option value="class">班级</option><option value="study">自学</option></select>
+          <span class="filter-summary" id="filter-summary" role="status"></span>
         </div>
         <table>
           <thead>
@@ -688,314 +1170,14 @@ _INDEX_HTML = '''<!doctype html>
     <div class="modal-body">
       <div class="modal-head">
         <span id="modal-title">日志</span>
+        <span id="modal-status" role="status"></span>
         <button onclick="closeLogs()">✕ 关闭</button>
       </div>
       <div class="modal-logs" id="modal-logs"></div>
     </div>
   </div>
 
-<script>
-let activeLogKey = null;
-let logTimer = null;
-let currentTasks = [];
-let captureActive = false;
-let lastCaptureState = null;
-const CONFIG_KEYS = ["USERTOKEN", "ABC", "AUTH_V", "USER_AGENT", "COURSE_ID", "STUDY_GRADE", "LLM_URL", "LLM_KEY", "LLM_MODEL"];
-
-function setTaskControlsDisabled(disabled) {
-  document.querySelectorAll("#task-card button").forEach(button => {
-    button.disabled = !!disabled;
-  });
-}
-
-function renderCaptureStatus(capture) {
-  const state = capture.state || "idle";
-  captureActive = !!capture.active;
-  const pill = document.getElementById("capture-pill");
-  const message = document.getElementById("capture-message");
-  const start = document.getElementById("capture-start");
-  const cancel = document.getElementById("capture-cancel");
-  const okStates = new Set(["succeeded"]);
-  const warnStates = new Set(["failed", "cancelled", "timed_out"]);
-  pill.className = "status-box" + (okStates.has(state) ? " ok" : warnStates.has(state) ? " warn" : "");
-  pill.textContent = ({
-    idle: "等待获取", starting: "正在启动", waiting: "等待微信请求",
-    validating: "正在验证", cancelling: "正在取消", succeeded: "获取成功",
-    failed: "获取失败", cancelled: "已取消", timed_out: "已超时",
-  })[state] || state;
-  message.textContent = capture.message || "";
-  start.disabled = captureActive;
-  cancel.disabled = !capture.can_cancel;
-  setTaskControlsDisabled(captureActive);
-  if (captureActive) {
-    document.getElementById("status").textContent = "鉴权获取期间已暂停任务刷新和启动";
-  }
-}
-
-async function refreshCaptureStatus() {
-  try {
-    const response = await fetch("/api/auth/capture/status");
-    const data = await response.json();
-    if (!data.ok) throw new Error(data.error || "读取获取状态失败");
-    const previous = lastCaptureState;
-    renderCaptureStatus(data.capture);
-    lastCaptureState = data.capture.state;
-    if (previous && previous !== "succeeded" && data.capture.state === "succeeded") {
-      await loadConfig();
-      await loadTasks();
-    }
-  } catch (error) {
-    const pill = document.getElementById("capture-pill");
-    pill.className = "status-box warn";
-    pill.textContent = "状态读取失败";
-    document.getElementById("capture-message").textContent = error.message;
-  }
-}
-
-async function startCapture() {
-  const start = document.getElementById("capture-start");
-  start.disabled = true;
-  try {
-    const response = await fetch("/api/auth/capture/start", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
-    });
-    const data = await response.json();
-    if (data.capture) renderCaptureStatus(data.capture);
-    if (!data.ok) throw new Error(data.error || data.message || "无法开始获取");
-    lastCaptureState = data.capture.state;
-  } catch (error) {
-    alert("获取启动失败: " + error.message);
-    await refreshCaptureStatus();
-  }
-}
-
-async function cancelCapture() {
-  const response = await fetch("/api/auth/capture/cancel", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
-  });
-  const data = await response.json();
-  if (data.capture) renderCaptureStatus(data.capture);
-  if (!data.ok) alert("取消失败: " + (data.error || data.message || "未知错误"));
-}
-
-async function loadConfig() {
-  try {
-    const r = await fetch("/api/config");
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error || "读取配置失败");
-    for (const key of CONFIG_KEYS) {
-      const el = document.getElementById(key);
-      if (el) el.value = j.config[key] || "";
-    }
-    document.getElementById("env-path").textContent = `📄 ${j.env_file}`;
-    renderConfigStatus(j.missing_auth || []);
-  } catch (e) {
-    const pill = document.getElementById("config-pill");
-    pill.className = "status-box warn";
-    pill.textContent = "配置读取失败";
-    document.getElementById("env-path").textContent = "❌ " + e.message;
-  }
-}
-
-function renderConfigStatus(missing) {
-  const pill = document.getElementById("config-pill");
-  if (!missing || missing.length === 0) {
-    pill.className = "status-box ok";
-    pill.textContent = "鉴权配置完整，可直接启动任务";
-    return;
-  }
-  pill.className = "status-box warn";
-  pill.textContent = `缺少字段: ${missing.join(", ")}`;
-}
-
-async function saveConfig(refreshTasks) {
-  const payload = {};
-  for (const key of CONFIG_KEYS) {
-    const el = document.getElementById(key);
-    payload[key] = el ? el.value : "";
-  }
-  const r = await fetch("/api/config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const j = await r.json();
-  if (!j.ok) {
-    alert("保存失败: " + (j.error || "未知错误"));
-    return;
-  }
-  renderConfigStatus(j.missing_auth || []);
-  document.getElementById("env-path").textContent = `✅ 已保存到 ${j.env_file}`;
-  if (refreshTasks) await loadTasks();
-}
-
-async function loadTasks() {
-  if (captureActive) {
-    document.getElementById("status").textContent = "鉴权获取期间已暂停任务刷新和启动";
-    return;
-  }
-  document.getElementById("status").textContent = "拉取中...";
-  try {
-    const r = await fetch("/api/tasks");
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error);
-    render(j.tasks);
-    const warnings = (j.warnings || []).length ? ` · ${j.warnings.join(" · ")}` : "";
-    document.getElementById("status").textContent =
-      `共 ${j.tasks.length} 个任务 · 已更新 ${new Date().toLocaleTimeString()}${warnings}`;
-  } catch (e) {
-    document.getElementById("status").textContent = "❌ " + e.message;
-  }
-}
-
-function render(tasks) {
-  currentTasks = tasks;
-  const tb = document.getElementById("tbody");
-  if (!tasks.length) {
-    tb.innerHTML = `<tr><td colspan="6" style="color:#667085; text-align:center; padding:24px;">暂无任务，或当前账号下还没有可见任务。</td></tr>`;
-    return;
-  }
-  tb.innerHTML = tasks.map((t, i) => {
-    const prog = t.progress || 0;
-    const score = t.score == null ? "-" : t.score;
-    const scoreCls = t.score >= 100 ? "score full" : "score";
-    let badge = `<span class="badge">${escapeHtml(t.source_label || "")}</span>`;
-    if (t.running) {
-      badge += t.loop
-        ? ` <span class="badge run">🔁 循环中 (第${t.round}轮)</span>`
-        : ` <span class="badge run">运行中</span>`;
-    } else if (t.done) {
-      badge += ` <span class="badge done">已完成</span>`;
-    }
-    return `
-      <tr>
-        <td>${i}</td>
-        <td>${escapeHtml(t.task_name)}</td>
-        <td>
-          <div class="progress-bar"><div style="width:${prog}%"></div></div>
-          ${prog}%
-        </td>
-        <td class="${scoreCls}">${score}</td>
-        <td>${badge}</td>
-        <td>
-          ${!t.can_start
-            ? `<button disabled title="${escapeHtml(t.note || "暂不支持启动")}">仅展示</button>`
-            : t.running
-            ? `<button class="danger" onclick="stopTask(${i})">停止</button>
-               <button onclick="showLogs(${i})">日志</button>`
-            : `<button class="primary" onclick="startTask(${i}, false)">▶ 启动</button>
-               <button class="loop" onclick="startTask(${i}, true)" title="刷到100分为止">🔁 循环</button>
-               ${t.done ? `<button onclick="showLogs(${i})">日志</button>` : ""}`
-          }
-        </td>
-      </tr>`;
-  }).join("");
-  setTaskControlsDisabled(captureActive);
-}
-
-function taskPayload(task, loop) {
-  return {
-    source: task.source || "class",
-    task_id: task.task_id,
-    release_id: task.release_id,
-    course_id: task.course_id,
-    list_id: task.list_id,
-    task_type: task.task_type,
-    grade: task.grade,
-    loop: !!loop,
-  };
-}
-
-async function startTask(index, loop) {
-  if (captureActive) return;
-  const task = currentTasks[index];
-  if (!task) return;
-  const r = await fetch("/api/start", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(taskPayload(task, loop))
-  });
-  const j = await r.json();
-  if (!j.ok) { alert("启动失败: " + j.error); return; }
-  showLogs(index, loop);
-  loadTasks();
-}
-
-async function stopTask(index) {
-  const task = currentTasks[index];
-  if (!task) return;
-  if (!confirm("停止任务?")) return;
-  const r = await fetch("/api/stop", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(taskPayload(task, false))
-  });
-  const j = await r.json();
-  if (!j.ok) alert("停止失败: " + j.error);
-  loadTasks();
-}
-
-async function startAllClassLoop() {
-  if (captureActive) return;
-  if (!confirm("确定要一键启动所有班级任务循环（刷到满分）？")) return;
-  const r = await fetch("/api/start_all", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({})
-  });
-  const j = await r.json();
-  if (!j.ok) { alert("启动失败: " + j.error); return; }
-  alert(`已启动 ${j.started} 个任务循环，跳过 ${j.skipped} 个（运行中/已满分）`);
-  loadTasks();
-}
-
-async function showLogs(index, loop) {
-  const task = currentTasks[index];
-  if (!task) return;
-  activeLogKey = taskPayload(task, false);
-  document.getElementById("modal-title").textContent = "📜 " + task.task_name + (loop ? " 🔁" : "");
-  document.getElementById("modal").classList.add("show");
-  await refreshLogs();
-  if (logTimer) clearInterval(logTimer);
-  logTimer = setInterval(refreshLogs, 1500);
-}
-
-function closeLogs() {
-  activeLogKey = null;
-  document.getElementById("modal").classList.remove("show");
-  if (logTimer) { clearInterval(logTimer); logTimer = null; }
-}
-
-async function refreshLogs() {
-  if (!activeLogKey) return;
-  try {
-    const qs = new URLSearchParams({
-      source: activeLogKey.source || "class",
-      task_id: activeLogKey.task_id,
-      release_id: activeLogKey.release_id,
-    });
-    const r = await fetch(`/api/logs?${qs.toString()}`);
-    const j = await r.json();
-    if (j.ok) {
-      const box = document.getElementById("modal-logs");
-      const wasBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
-      box.textContent = j.logs.join("\\n");
-      if (wasBottom) box.scrollTop = box.scrollHeight;
-      if (j.done) {
-        clearInterval(logTimer); logTimer = null;
-        loadTasks();
-      }
-    }
-  } catch (e) {}
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
-  }[c]));
-}
-
-loadConfig().then(refreshCaptureStatus).then(() => { if (!captureActive) loadTasks(); });
-setInterval(refreshCaptureStatus, 1000);
-setInterval(() => { if (!captureActive) loadTasks(); }, 5000);
-</script>
+<script src="/ui.js"></script>
 </body>
 </html>
 '''
