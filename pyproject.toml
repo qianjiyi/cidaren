@@ -20,4 +20,4 @@ cidaren = "cidaren.web:main"
 packages = ["cidaren"]
 
 [tool.setuptools.package-data]
-cidaren = ["bank.json"]
+cidaren = ["bank.json", "web_ui.js"]
