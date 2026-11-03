@@ -61,6 +61,8 @@ def normalized(value):
 
 
 def is_collocation(topic):
+    if topic.get("answer_kind") == "choices":
+        return True
     remark = (topic.get("stem") or {}).get("remark")
     return topic.get("topic_mode") == 31 and isinstance(remark, list) and bool(remark) and isinstance(remark[0], dict)
 
@@ -68,9 +70,24 @@ def is_collocation(topic):
 def snapshot(topic):
     # No session credentials or transient topic/task identifiers are persisted.
     out = {k: topic[k] for k in ("topic_mode", "stem", "options", "answer_num") if k in topic}
-    for k, v in topic.items():
-        if any(token in k.lower() for token in ("image", "audio", "img", "sound", "voice")):
-            out[k] = v
+    if topic.get("test_protocol_version") == 1:
+        # Only normalized test records gain these fields. Existing learning
+        # snapshots and their exact hashes therefore remain byte compatible.
+        for key in ("test_protocol_version", "topic_mode_raw", "answer_kind", "raw_options",
+                    "slot_count", "w_lens", "w_len", "w_tip", "chance_num"):
+            if key in topic:
+                out[key] = topic[key]
+        try:
+            from .test_protocol import media_snapshot
+        except ImportError:
+            from test_protocol import media_snapshot
+        for key, value in (media_snapshot(topic) or {}).items():
+            if key not in out:
+                out[key] = value
+    else:
+        for k, v in topic.items():
+            if any(token in k.lower() for token in ("image", "audio", "img", "sound", "voice")):
+                out[k] = v
     out.setdefault("stem", {})
     out.setdefault("options", [])
     return json.loads(dump(out))
@@ -102,6 +119,12 @@ def scope_key(topic):
 
 
 def _has_media(topic):
+    if topic.get("test_protocol_version") == 1:
+        try:
+            from .test_protocol import has_media
+        except ImportError:
+            from test_protocol import has_media
+        return has_media(topic)
     return any(re.search(r"image|audio|img|sound|voice", k, re.I) and v for k, v in topic.items()) or any(
         re.search(r"image|audio|img|sound|voice", k, re.I) and v
         for obj in [topic.get("stem") or {}, *(topic.get("options") or [])]
@@ -113,6 +136,10 @@ def semantic_key(topic):
     mode = topic.get("topic_mode")
     stem_obj = topic.get("stem") or {}
     stem, remark = stem_obj.get("content", ""), stem_obj.get("remark", "")
+    if topic.get("test_protocol_version") == 1 and topic.get("topic_mode_raw") != mode:
+        return None
+    if topic.get("answer_kind") == "fill_slots" or "raw_options" in topic:
+        return None
     if mode not in KNOWN_MODES or _has_media(topic):
         return None
     if mode in (0, 15, 21, 22) and not remark and re.fullmatch(r"[A-Za-z][A-Za-z' -]*", stem.strip()):
@@ -146,6 +173,16 @@ def _same_tag(left, right):
 
 def encode_answer(topic, answer):
     opts = topic.get("options") or []
+    if topic.get("answer_kind") == "fill_slots":
+        lengths = topic.get("w_lens")
+        if (not isinstance(answer, list) or not isinstance(lengths, list)
+                or any(type(length) is not int or length <= 0 for length in lengths)
+                or len(answer) != len(lengths) or not answer
+                or topic.get("slot_count") != len(lengths)
+                or any(not isinstance(item, str) or not item.strip() or len(item.strip()) > length
+                       for item, length in zip(answer, lengths))):
+            raise BankError("多空答案必须按题目顺序完整填写，并符合每空长度")
+        return {"kind": "slots", "items": [item.strip() for item in answer]}
     if topic.get("topic_mode") == 32:
         if not isinstance(answer, str):
             raise BankError("组词答案必须是有序文字序列")
@@ -173,13 +210,25 @@ def encode_answer(topic, answer):
             return {"kind": "choices", "items": sorted(texts, key=norm)}
         return {"kind": "choice", "text": texts[0]}
     if isinstance(answer, str) and answer.strip():
-        return {"kind": "fill", "text": answer.strip()}
+        text = answer.strip()
+        if topic.get("test_protocol_version") == 1 and "w_len" in topic:
+            limit = topic["w_len"]
+            if type(limit) is not int or limit <= 0 or len(text) > limit:
+                raise BankError("测试输入答案超过官方长度限制")
+        return {"kind": "fill", "text": text}
     raise BankError("填空答案必须是非空文字")
 
 
 def map_answer(topic, saved):
     opts = topic.get("options") or []
     kind = saved.get("kind")
+    if kind == "slots":
+        if topic.get("answer_kind") != "fill_slots":
+            return None
+        try:
+            return encode_answer(topic, saved.get("items"))["items"]
+        except BankError:
+            return None
     if kind == "words":
         if topic.get('topic_mode') != 32:
             return None
@@ -199,6 +248,11 @@ def map_answer(topic, saved):
             words.append(matches.pop())
         return ",".join(words)
     if kind == "fill":
+        if topic.get("test_protocol_version") == 1:
+            try:
+                return encode_answer(topic, saved.get("text"))["text"] if not opts else None
+            except BankError:
+                return None
         return saved.get("text") if not opts and saved.get("text") else None
     if kind in ("choice", "choices"):
         texts = [saved.get("text")] if kind == "choice" else saved.get("items") or []
@@ -227,7 +281,7 @@ def _validate_saved(saved):
     if kind in ('choice','fill'):
         if not isinstance(saved.get('text'),str) or not saved['text'].strip():
             raise ValueError('答案文字缺失')
-    elif kind in ('choices','words'):
+    elif kind in ('choices','words','slots'):
         items = saved.get('items')
         if not isinstance(items,list) or not items or any(not isinstance(x,str) or not x.strip() for x in items):
             raise ValueError('答案序列缺失或格式错误')
@@ -530,7 +584,7 @@ class BankStore:
                     raise ValueError('迁移数量不一致')
                 if not re.fullmatch(r'[0-9a-f]{64}',metadata['sha256']):
                     raise ValueError('原题库哈希不合法')
-                for row in con.execute('SELECT topic_json,answer_json,raw_answer_json,exact_key FROM records'):
+                for row in con.execute('SELECT topic_json,answer_json,raw_answer_json,exact_key,verification FROM records'):
                     topic, answer = json.loads(row[0]), json.loads(row[1])
                     json.loads(row[2])
                     if not isinstance(topic, dict) or not isinstance(topic.get('stem'), dict) or not isinstance(topic.get('options'), list):
@@ -540,6 +594,24 @@ class BankStore:
                     if row[3] != exact_key(topic):
                         raise ValueError('精确题目索引不一致')
                     _validate_saved(answer)
+                    if ('test_protocol_version' in topic
+                            and (type(topic['test_protocol_version']) is not int or topic['test_protocol_version'] != 1)):
+                        raise ValueError('测试题目协议版本不兼容')
+                    if topic.get('test_protocol_version') == 1:
+                        try:
+                            from .test_protocol import normalize_topic
+                        except ImportError:
+                            from test_protocol import normalize_topic
+                        try:
+                            checked = normalize_topic({**topic, 'topic_code':'stored-record'})
+                        except Exception as exc:
+                            raise ValueError('测试题目协议字段损坏') from exc
+                        if snapshot(checked) != snapshot(topic):
+                            raise ValueError('测试题目适配字段不一致')
+                        pending_subset = (row[4] == 'pending' and answer.get('kind') == 'choices'
+                                          and map_answer({**topic, 'answer_num':None}, answer) is not None)
+                        if map_answer(topic, answer) is None and not pending_subset:
+                            raise ValueError('测试答案不能映射到保存题目')
                 for table, field in [('legacy','value_json'),('knowledge','answer_json'),('rejections','answer_json'),('observations','detail_json')]:
                     for row in con.execute(f'SELECT {field} FROM {table}'):
                         parsed = json.loads(row[0])
@@ -650,7 +722,14 @@ class BankStore:
                     if hit:
                         return hit
             legacy_rows = []
-            for old_key in legacy_keys(topic):
+            legacy_compatible = (topic.get('test_protocol_version') != 1 or (
+                topic.get('topic_mode') in KNOWN_MODES
+                and topic.get('topic_mode_raw') == topic.get('topic_mode')
+                and 'raw_options' not in topic and topic.get('answer_kind') != 'fill_slots'
+                and not _has_media(topic)))
+            if not legacy_compatible:
+                reasons.append('该测试题型仅支持完整精确匹配，不试用历史候选')
+            for old_key in legacy_keys(topic) if legacy_compatible else ():
                 row = con.execute("SELECT value_json,issue FROM legacy WHERE key=?", (old_key,)).fetchone()
                 if row and not row['issue'] and not _has_media(topic):
                     old_topic, saved = parse_legacy(old_key, json.loads(row['value_json']))

@@ -1,6 +1,6 @@
 ﻿"""
-词达人 (vocabgo) 全自动答题脚本 v3
-支持 mode=0/11/31/32 全题型, 匹配不上时用 LLM 兜底
+词达人请求客户端及学习、自学、测试共用入口。
+服务器确认任务类型后分流，提交保护由 task_safety 统一管理。
 """
 
 import base64, hashlib, json, math, os, random, re, sys, time, requests, uuid, certifi
@@ -10,13 +10,17 @@ from pathlib import Path
 try:
     from .config import get_missing_auth_fields, get_runtime_config
     from .bank_store import BankError, default_store, prepare_default_store, encode_answer, tag_for_option, norm
-    from .task_categories import classify_task
+    from .task_categories import classify_task, is_unstarted_class_test
+    from .task_lists import read_class_tasks
     from .task_safety import SafetyError, SafetyPaused, SafetyStore, account_key
+    from .network import create_session, llm_session, close_thread_sessions, proxy_mode, request_json, NetworkError
 except ImportError:  # pragma: no cover
     from config import get_missing_auth_fields, get_runtime_config
     from bank_store import BankError, default_store, prepare_default_store, encode_answer, tag_for_option, norm
-    from task_categories import classify_task
+    from task_categories import classify_task, is_unstarted_class_test
+    from task_lists import read_class_tasks
     from task_safety import SafetyError, SafetyPaused, SafetyStore, account_key
+    from network import create_session, llm_session, close_thread_sessions, proxy_mode, request_json, NetworkError
 
 SALT = "ajfajfamsnfaflfasakljdlalkflak"
 VERSION = "2.7.0.260507_01"
@@ -165,12 +169,16 @@ def _chat_completions_url(llm_url: str) -> str:
 
 def _is_collocation(topic):
     """搭配题: mode=31 但 stem.remark 是 list (含 relation 字段)"""
+    if topic.get("answer_kind") == "choices":
+        return True
     if topic.get("topic_mode") != 31:
         return False
     rk = (topic.get("stem") or {}).get("remark")
     return isinstance(rk, list) and len(rk) > 0 and isinstance(rk[0], dict)
 
-def _llm_answer(topic, word_defs):
+def _llm_answer(topic, word_defs, *, deadline=None):
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     runtime = get_runtime_config()
     llm_url = (runtime.get("LLM_URL") or "").strip()
     llm_key = (runtime.get("LLM_KEY") or "").strip()
@@ -183,7 +191,11 @@ def _llm_answer(topic, word_defs):
     stem = stem_obj.get("content", "")
     remark = stem_obj.get("remark", "") or ""
     opts = topic.get("options") or []
-    opts_str = "\n".join(f"{i}. {o.get('content','')}" for i, o in enumerate(opts))
+    opts_str = "\n".join(
+        f"{i}. " + (f"{o['parent_content']} → " if 'parent_content' in o else "") + o.get('content', '')
+        for i, o in enumerate(opts)
+    )
+    ordered_slots = topic.get("answer_kind") == "fill_slots"
 
     # 构建 word_defs 上下文
     wd_str = ""
@@ -191,7 +203,20 @@ def _llm_answer(topic, word_defs):
         wd_lines = [f"  {w}: {'; '.join(ds)}" for w, ds in list(word_defs.items())[:40]]
         wd_str = "已知单词释义:\n" + "\n".join(wd_lines) + "\n\n"
 
-    if mode == 32:
+    if ordered_slots:
+        prompt = f"""{wd_str}题目: 按题干从左到右补全每个空格。
+题干: {stem}
+提示: {remark}
+各空最大长度: {topic.get('w_lens')}
+只输出 JSON 字符串数组，长度与空格数相同，例如 [\"word\",\"phrase\"]。不要解释。"""
+    elif topic.get("test_protocol_version") == 1 and mode in {51, 52, 53, 54}:
+        prompt = f"""{wd_str}题目: 根据题干和提示填写英文答案。
+题干: {stem}
+备注: {remark}
+拼写提示: {topic.get('w_tip', '')}
+最大长度: {topic.get('w_len', '未提供')}
+只输出应填的英文字符串，不要编号、引号或解释。"""
+    elif mode == 32:
         prompt = f"""{wd_str}题目: 用选项中的词组成短语, 中文含义是「{remark}」
 空格数: {stem}
 选项:
@@ -250,37 +275,31 @@ def _llm_answer(topic, word_defs):
             ]
         }
         url = _chat_completions_url(llm_url)
-        resp = None
-        last_err = None
-        for attempt in range(3):
-            try:
-                resp = requests.post(url, headers=headers, json=data, timeout=(10, 60))
-                resp.raise_for_status()
-                break
-            except (requests.Timeout, requests.ConnectionError) as e:
-                last_err = e
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                print(f"    LLM error: {e} (重试 {attempt+1} 次后失败)")
-                return None
-        if resp is None:
-            print(f"    LLM error: {last_err}")
-            return None
-        if not resp.text.strip():
-            print(f"    LLM error: 空响应 (status={resp.status_code})")
-            return None
-        try:
-            rj = resp.json()
-        except ValueError:
-            print(f"    LLM error: 非 JSON 响应 (status={resp.status_code}): {resp.text[:200]}")
-            return None
+        session = llm_session(runtime)
+        rj = request_json(
+            lambda timeout: session.post(url, headers=headers, json=data, timeout=timeout, allow_redirects=False),
+            service="llm", action="chat/completions", route=proxy_mode(runtime, "llm"),
+            attempts=1 if deadline is not None else 2, read_timeout=45,
+            deadline=deadline if deadline is not None else time.monotonic() + 90,
+        )
         if "choices" not in rj or not rj["choices"]:
-            print(f"    LLM error: 响应无 choices: {rj}")
+            print("    LLM error: 响应缺少有效 choices")
+            return None
+        if deadline is not None and time.monotonic() >= deadline:
             return None
         ans_text = rj["choices"][0]["message"]["content"].strip()
 
-        if mode == 32:
+        if ordered_slots:
+            try:
+                parts = json.loads(ans_text)
+            except (ValueError, TypeError):
+                return None
+            lengths = topic.get("w_lens") or []
+            if (not isinstance(parts, list) or len(parts) != len(lengths)
+                    or any(not isinstance(value, str) or not value.strip() for value in parts)):
+                return None
+            return [value.strip() for value in parts]
+        elif mode == 32:
             numeric_parts = [p for p in re.split(r'[,，\s]+', ans_text.strip()) if p]
             if numeric_parts and all(re.fullmatch(r'\d+', p) for p in numeric_parts):
                 words = []
@@ -311,8 +330,10 @@ def _llm_answer(topic, word_defs):
             ans_norm = _norm(ans_text)
             matches = [tag_for_option(opt,i) for i,opt in enumerate(opts) if ans_norm and ans_norm == _norm(opt.get('content'))]
             return matches[0] if len(matches) == 1 else None
-    except Exception as e:
+    except NetworkError as e:
         print(f"    LLM error: {e}")
+    except Exception as e:
+        print(f"    LLM error: 响应或配置无效（{type(e).__name__}）")
     return None
 
 # ── 答案匹配 ──
@@ -403,7 +424,13 @@ def _valid_code(code):
     return type(code) is int and code > 0 or isinstance(code, str) and bool(code.strip())
 
 
-def _complete_topic(topic, task_kind):
+def _complete_topic(topic, task_kind, *, task_type=None):
+    if task_type == 2:
+        if __package__ in (None, ""):
+            from test_protocol import normalize_topic
+        else:
+            from .test_protocol import normalize_topic
+        return normalize_topic(topic)
     if not isinstance(topic, dict) or not _valid_code(topic.get("topic_code")):
         raise SafetyError("服务器未返回完整题目凭据，已停止推进")
     mode = _strict_int(topic.get("topic_mode"))
@@ -447,9 +474,9 @@ def _strict_verification(data):
 
 
 class Client:
-    def __init__(self, usertoken, abc, auth_v, ua="", *, expected_account_key=None, safety_store=None):
-        self.s = requests.Session()
-        self.s.verify = certifi.where()
+    def __init__(self, usertoken, abc, auth_v, ua="", *, expected_account_key=None, safety_store=None, config=None):
+        self.network_config = dict(config if config is not None else get_runtime_config())
+        self.s = create_session(self.network_config, "official")
         self.s.headers.update({
             "host": "app.vocabgo.com", "usertoken": usertoken, "abc": abc,
             "authorization-v": auth_v, "x-requested-with": "XMLHttpRequest",
@@ -471,17 +498,22 @@ class Client:
         self._verification_over = False
         self._saved_topic = False
         self._batch_finished = False
+        self._response_topic = None
+        self._test_initializations = set()
 
-    @staticmethod
-    def _read_request(callback):
-        for attempt in range(3):
-            try:
-                return callback()
-            except (requests.Timeout, requests.ConnectionError):
-                if attempt == 2:
-                    raise
-                print(f"⚠️ 只读请求暂时失败，重试 {attempt + 1}/2")
-                time.sleep(0.5 * (attempt + 1))
+    def close(self):
+        self.s.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def _json_request(self, send, path, *, readonly=False):
+        return _decrypt(request_json(send, service="official", action=path.rsplit("/", 1)[-1],
+                                     route=proxy_mode(self.network_config, "official"),
+                                     attempts=3 if readonly else 1))
 
     def _credentials(self):
         return tuple(self.s.headers.get(key) for key in ("usertoken", "abc", "authorization-v", "user-agent"))
@@ -498,17 +530,11 @@ class Client:
 
     def _lookup_task(self, task_kind, task_id, release_id, course_id, list_id):
         if task_kind == "class":
-            matches = []
-            for page in range(1, 101):
-                data = _task_data(self.page_task(page=page, size=200), "读取班级任务")
-                records = data.get("records")
-                if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
-                    raise _denied("班级任务列表格式异常，不能确认任务归属")
-                matches.extend(record for record in records
-                               if str(record.get("release_id")) == str(release_id))
-                total = data.get("total")
-                if len(records) < 200 or type(total) is int and page * 200 >= total:
-                    break
+            try:
+                records = read_class_tasks(self)
+            except ValueError as exc:
+                raise _denied(str(exc)) from None
+            matches = [record for record in records if str(record.get("release_id")) == str(release_id)]
             if len(matches) != 1:
                 raise _denied("任务不在当前账户的班级列表中，或任务归属不唯一")
             record = dict(matches[0])
@@ -531,19 +557,28 @@ class Client:
                 raise _denied("自学任务编号与课程词表不匹配，请刷新列表")
             record.update(source="study", course_id=course_id, list_id=list_id)
         else:
-            raise _denied("当前程序只支持普通学习和自学任务")
+            raise _denied("当前程序只支持班级学习、测试和自学任务")
         classified = classify_task(record)
-        wanted_type = 1 if task_kind == "class" else 3
-        if _strict_int(record.get("task_type")) != wanted_type or not classified.get("can_start"):
+        supported_types = {1, 2} if task_kind == "class" else {3}
+        if _strict_int(record.get("task_type")) not in supported_types or not classified.get("can_start"):
             raise _denied(classified.get("eligibility_reason") or "任务类型未确认，禁止答题")
         return record
 
+    @property
+    def task_type(self):
+        return _strict_int((self._task_metadata or {}).get("task_type"))
+
     @contextmanager
-    def task_scope(self, task_kind, task_id=None, release_id=None, course_id=None, list_id=None, task_type=None, grade=2):
-        expected_type = 1 if task_kind == "class" else 3
-        if task_type is not None and _strict_int(task_type) != expected_type:
-            raise _denied("调用参数与普通学习任务类型不一致")
+    def task_scope(self, task_kind, task_id=None, release_id=None, course_id=None, list_id=None, task_type=None, grade=2,
+                   *, expected_type=None):
+        supported = {1, 2} if task_kind == "class" else {3} if task_kind == "study" else set()
+        if not supported or (task_type is not None and _strict_int(task_type) not in supported):
+            raise _denied("调用参数与支持的任务类型不一致")
         if self._task_context is not None:
+            if self._task_metadata.get("source") != task_kind or (expected_type is not None and self.task_type != expected_type):
+                raise _denied("当前任务类型与执行流程不一致")
+            if task_type is not None and _strict_int(task_type) != self.task_type:
+                raise _denied("调用参数与服务器任务类型不一致")
             payload = {"task_id": task_id}
             if task_kind == "class":
                 payload["release_id"] = release_id
@@ -554,6 +589,10 @@ class Client:
             return
         key = self.get_account_key()
         metadata = self._lookup_task(task_kind, task_id, release_id, course_id, list_id)
+        server_type = _strict_int(metadata.get("task_type"))
+        if ((expected_type is not None and server_type != expected_type)
+                or (task_type is not None and _strict_int(task_type) != server_type)):
+            raise _denied("服务器任务类型与所选执行流程不一致")
         with self.safety_store.scope(key, task_kind, release_id=release_id, course_id=course_id, list_id=list_id) as context:
             self._task_context = context
             self._task_metadata = metadata
@@ -581,7 +620,14 @@ class Client:
         source = metadata["source"]
         if "/ClassTask/" in path and source != "class" or "/StudyTask/" in path and source != "study":
             raise _denied("当前执行上下文与请求的任务来源不一致")
-        wanted = 1 if source == "class" else 3
+        wanted = self.task_type
+        if wanted not in ({1, 2} if source == "class" else {3}):
+            raise _denied("任务类型不受支持")
+        action = path.rsplit("/", 1)[-1]
+        if wanted == 2 and action not in {"Info", "StartAnswer", "VerifyAnswer", "SubmitAnswerAndSave", "SkipAnswer"}:
+            raise _denied("测试流程不允许选词、重置、创建任务或签到")
+        if action == "SkipAnswer" and wanted != 2:
+            raise _denied("跳题接口仅用于测试流程")
         if "task_type" in payload and _strict_int(payload["task_type"]) != wanted:
             raise _denied("请求任务类型与服务端元数据不一致")
         for field in (("release_id",) if source == "class" else ("course_id", "list_id")):
@@ -594,6 +640,10 @@ class Client:
                 context.pause("题目操作凭据与当前题目不一致，禁止继续提交")
             if self._saved_topic:
                 context.pause("当前题目已尝试保存，禁止再次验证或保存")
+        if action == "SkipAnswer":
+            if self._active_topic is None or self._verification_over:
+                context.pause("本题未处于可跳过状态，禁止跳题")
+            self._saved_topic = True
         if path.endswith("/SubmitAnswerAndSave"):
             if self._active_topic is None or not (self._active_topic["topic_mode"] == 0 or self._verification_over):
                 context.pause("服务器尚未明确结束本题验证，禁止保存")
@@ -609,7 +659,7 @@ class Client:
     def activate_topic(self, topic, *, registered=False):
         if self._task_context is None:
             raise _denied("答题需要任务执行上下文")
-        _complete_topic(topic, self._task_metadata["source"])
+        topic = _complete_topic(topic, self._task_metadata["source"], task_type=self.task_type)
         if not registered and self._task_context.is_seen(topic["topic_code"]):
             self.pause("服务器返回已经使用过的题目凭据，已暂停以避免重复保存")
         # Receiving a full next question is not a submission. Keep it resumable
@@ -621,7 +671,17 @@ class Client:
 
     def _validate_advance(self, path, response):
         action = path.rsplit("/", 1)[-1]
-        if _response_code(response) == 20001 and action in {"StartAnswer", "SubmitAnswerAndSave"}:
+        code = _response_code(response)
+        if self.task_type == 2 and code == 21006:
+            self.pause("词达人要求人工验证码；请在官方端处理并核对当前题，再重新同步")
+        if self.task_type == 2 and code in {20004, 20006} and action in {"StartAnswer", "SubmitAnswerAndSave", "SkipAnswer"}:
+            if ("msg" in response and not isinstance(response["msg"], str)
+                    or response.get("data") is not None and not isinstance(response["data"], dict)):
+                raise SafetyError("测试结束响应格式异常，结果需核对")
+            self._observe_task_metadata(response.get("data"))
+            self._batch_finished = True
+            return
+        if self.task_type != 2 and code == 20001 and action in {"StartAnswer", "SubmitAnswerAndSave"}:
             if ("data" not in response or response["data"] is not None and not isinstance(response["data"], dict)
                     or "msg" in response and not isinstance(response["msg"], str)):
                 raise SafetyError("需要选词响应结构不完整，不能确认当前操作结果")
@@ -631,9 +691,10 @@ class Client:
             return
         data = _task_data(response, action, allow_empty=action in {"SubmitChoseWord", "StartTask", "Do"})
         if action == "StartAnswer":
-            topic = _complete_topic(_get_topic(response), self._task_metadata["source"])
+            topic = self._response_question(response)
             if self._task_context.is_seen(topic["topic_code"]):
                 self.pause("启动响应返回已经处理过的题目凭据，已暂停")
+            self._response_topic = topic
         elif action == "VerifyAnswer":
             _strict_verification(data)
             code = data["topic_code"]
@@ -644,18 +705,28 @@ class Client:
             if not any(str(alias) == str(code) for alias in self._topic_aliases):
                 self._topic_aliases.append(code)
             self._verification_over = data["over_status"] == 1
-        elif action == "SubmitAnswerAndSave":
-            topic = _get_topic(response)
-            _complete_topic(topic, self._task_metadata["source"])
+        elif action in {"SubmitAnswerAndSave", "SkipAnswer"}:
+            topic = self._response_question(response)
             if (any(str(alias) == str(topic["topic_code"]) for alias in self._topic_aliases)
                     or self._task_context.is_seen(topic["topic_code"])):
                 self.pause("保存后返回旧题目凭据，无法确认题目推进，已暂停")
+            self._response_topic = topic
         self._observe_task_metadata(data)
+
+    def _response_question(self, response):
+        topic = _get_topic(response)
+        if self.task_type == 2 and isinstance(topic, dict):
+            topic = dict(topic)
+            data = response.get("data") or {}
+            for field in ("topic_done_num", "topic_total", "task_type"):
+                if field not in topic and field in data:
+                    topic[field] = data[field]
+        return _complete_topic(topic, self._task_metadata["source"], task_type=self.task_type)
 
     def _observe_task_metadata(self, data):
         if self._task_context is None or not isinstance(data, dict):
             return
-        wanted = 1 if self._task_metadata["source"] == "class" else 3
+        wanted = self.task_type
         if "task_type" in data and _strict_int(data["task_type"]) != wanted:
             self.pause("服务器返回的任务类型与当前执行上下文不一致")
         for field in (("release_id",) if self._task_metadata["source"] == "class" else ("course_id", "list_id")):
@@ -665,38 +736,83 @@ class Client:
             value = _returned_task_id(data, None)
             self._task_ids.add(str(value))
             self._task_metadata["task_id"] = value
+            if wanted == 2:
+                self._task_ids.discard("-1")
 
     def _advance(self, path, payload, callback):
         self._guard_request(path, payload)
-        if "task_id" in payload and (_strict_int(payload["task_id"]) is None or _strict_int(payload["task_id"]) <= 0):
-            raise _denied("任务推进需要已确认的正整数任务编号")
         action = path.rsplit("/", 1)[-1]
+        initialize_test = (action == "StartAnswer" and _strict_int(payload.get("task_id")) == -1
+                           and is_unstarted_class_test(self._task_metadata))
+        if ("task_id" in payload
+                and (_strict_int(payload["task_id"]) is None or _strict_int(payload["task_id"]) <= 0)
+                and not initialize_test):
+            raise _denied("任务推进需要已确认的正整数任务编号")
+        if initialize_test:
+            state = self._task_context._refresh()
+            self.safety_store._check_clean(state)
+            self.safety_store._check_not_terminal(state)
+            identity = (self._task_context.account_key, str(self._task_metadata["release_id"]))
+            if (identity in self._test_initializations or self._active_topic is not None
+                    or state.get("test_question") is not None or state.get("aliases")):
+                raise _denied("本次测试已经初始化或存在答题记录，禁止再次使用未开始任务编号")
+            # The attempted initialization is consumed before sending anything.
+            # A lost or invalid response must never cause another sentinel start.
+            self._test_initializations.add(identity)
+        self._response_topic = None
+        def validate_response(response):
+            if initialize_test and _response_code(response) == 1:
+                data = _task_data(response, "首次开始测试")
+                returned_id = _strict_int(data.get("task_id"))
+                if returned_id is None or returned_id <= 0:
+                    raise SafetyError("首次开始测试未返回有效的正整数任务编号，结果需核对")
+            self._validate_advance(path, response)
+
         def aliases(response):
             if action == "VerifyAnswer" and _response_code(response) == 1:
                 return [payload["topic_code"], response["data"]["topic_code"]]
-            if action == "SubmitAnswerAndSave" and _response_code(response) in {1, 20001}:
+            if action in {"SubmitAnswerAndSave", "SkipAnswer"} and _response_code(response) in {1, 20001, 20004, 20006}:
                 return [*self._topic_aliases, payload["topic_code"]]
             return []
+        extra = {}
+        if self.task_type == 2 and action in {"StartAnswer", "SubmitAnswerAndSave", "SkipAnswer"}:
+            def terminal(response):
+                code = _response_code(response)
+                return {"code": code, "at_ms": _ms()} if code in {20004, 20006} else None
+            def question(response):
+                if _response_code(response) in {20004, 20006}:
+                    return None
+                if __package__ in (None, ""):
+                    from test_protocol import TEST_LIMITS
+                else:
+                    from .test_protocol import TEST_LIMITS
+                topic = self._response_topic
+                return self._task_context.make_test_question(topic["topic_code"], topic.get("topic_done_num"),
+                                                             TEST_LIMITS[topic["topic_mode"]] * 1000)
+            extra = {"test_terminal": terminal, "test_question": question}
         response = self._task_context.execute(action, payload, callback,
-                                              lambda value: self._validate_advance(path, value),
+                                              validate_response,
                                               confirm_aliases=aliases,
-                                              begin_round=lambda value: action in {"SubmitChoseWord", "StartTask"} and _response_code(value) == 1)
-        if action in {"StartAnswer", "SubmitAnswerAndSave"} and _response_code(response) == 1:
-            self.activate_topic(_get_topic(response), registered=True)
+                                              begin_round=lambda value: action in {"SubmitChoseWord", "StartTask"} and _response_code(value) == 1,
+                                              **extra)
+        if initialize_test:
+            self._task_ids.discard("-1")
+        if action in {"StartAnswer", "SubmitAnswerAndSave", "SkipAnswer"} and _response_code(response) == 1:
+            self.activate_topic(self._response_topic, registered=True)
         return response
 
     def _get(self, path, params, base=BASE):
         params = {**params, "timestamp": _ms(), "version": VERSION, "app_type": 1}
-        callback = lambda: _decrypt(self.s.get(base + path, params=params, timeout=20).json())
+        send = lambda timeout: self.s.get(base + path, params={**params, "timestamp": _ms()}, timeout=timeout, allow_redirects=False)
         if path.endswith("/StartAnswer"):
-            return self._advance(path, params, callback)
+            return self._advance(path, params, lambda: self._json_request(send, path))
         allowed = {"/Student/Main", "/Student/ClassTask/Info", "/Student/ClassTask/ChoseWordList",
                    "/Student/StudyTask/List", "/Student/StudyTask/Info", "/Student/StudyTask/ChoseWordList"}
         if path not in allowed:
             raise _denied("未确认只读性质的接口不允许直接请求")
         if self._task_context is not None and path.rsplit("/", 1)[-1] in {"Info", "ChoseWordList"}:
             self._guard_request(path, params)
-        response = self._read_request(callback)
+        response = self._json_request(send, path, readonly=True)
         if path.rsplit("/", 1)[-1] in {"Info", "ChoseWordList"} and _response_code(response) == 1:
             self._observe_task_metadata(response.get("data"))
         return response
@@ -704,16 +820,21 @@ class Client:
     def _post(self, path, body, base=BASE):
         body = {**body, "timestamp": _ms(), "version": VERSION}
         body["sign"] = _sign(body); body["app_type"] = 1
-        callback = lambda: _decrypt(self.s.post(base + path, json=body, timeout=20).json())
+        def send(timeout):
+            fresh = {k: v for k, v in body.items() if k not in {"timestamp", "sign", "app_type"}}
+            fresh["timestamp"] = _ms()
+            fresh["sign"] = _sign(fresh)
+            fresh["app_type"] = 1
+            return self.s.post(base + path, json=fresh, timeout=timeout, allow_redirects=False)
         if path == "/Student/ClassTask/PageTask":
-            return self._read_request(callback)
+            return self._json_request(send, path, readonly=True)
         allowed = {"/Student/ClassTask/SubmitChoseWord", "/Student/ClassTask/VerifyAnswer",
-                   "/Student/ClassTask/SubmitAnswerAndSave", "/Student/StudyTask/StartTask",
+                   "/Student/ClassTask/SubmitAnswerAndSave", "/Student/ClassTask/SkipAnswer", "/Student/StudyTask/StartTask",
                    "/Student/StudyTask/SubmitChoseWord", "/Student/StudyTask/VerifyAnswer",
                    "/Student/StudyTask/SubmitAnswerAndSave", "/Student/TaskStudentSignin/Do"}
         if path not in allowed:
             raise _denied("当前程序不允许调用未支持的任务推进接口")
-        return self._advance(path, body, callback)
+        return self._advance(path, body, lambda: self._json_request(send, path))
 
     def page_task(self, page=1, size=50, search_type="0"):
         return self._post("/Student/ClassTask/PageTask", {"search_type": search_type, "page_count": page, "page_size": size})
@@ -728,6 +849,10 @@ class Client:
         return self._post("/Student/ClassTask/SubmitChoseWord", body)
     def start_answer(self, task_id, release_id):
         return self._get("/Student/ClassTask/StartAnswer", {"task_id": task_id, "task_type": 1, "release_id": release_id, "opt_img_w": 2300, "opt_font_size": 128, "opt_font_c": "#000000", "it_img_w": 2702, "it_font_size": 144})
+    def test_start_answer(self, task_id, release_id):
+        return self._get("/Student/ClassTask/StartAnswer", {"task_id": task_id, "task_type": 2, "release_id": release_id, "opt_img_w": 2300, "opt_font_size": 128, "opt_font_c": "#000000", "it_img_w": 2702, "it_font_size": 144})
+    def test_skip(self, topic_code, time_spent):
+        return self._post("/Student/ClassTask/SkipAnswer", {"topic_code": topic_code, "time_spent": time_spent, "opt_img_w": 2300, "opt_font_size": 128, "opt_font_c": "#000000", "it_img_w": 2702, "it_font_size": 144})
     def verify(self, topic_code, answer):
         return self._post("/Student/ClassTask/VerifyAnswer", {"topic_code": topic_code, "answer": answer})
     def submit(self, topic_code, time_spent):
@@ -790,7 +915,7 @@ def _get_topic(resp):
     return None
 
 def _valid_answer(topic, answer):
-    if isinstance(answer, list) and not _is_collocation(topic):
+    if isinstance(answer, list) and not _is_collocation(topic) and topic.get("topic_mode") != 73:
         return False
     try:
         encode_answer(topic, answer)
@@ -884,7 +1009,8 @@ def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None
         raise _denied("答题执行器需要可核验任务归属的 Client")
     with client.task_scope(task_kind, task_id=task_id, release_id=release_id,
                            course_id=course_id, list_id=list_id,
-                           task_type=task_type if task_kind == "study" else None, grade=grade):
+                           task_type=task_type if task_kind == "study" else None, grade=grade,
+                           expected_type=3 if task_kind == "study" else 1):
         if (task_kind == "study" and (_strict_int(task_id) is None or _strict_int(task_id) <= 0)
                 and _strict_int(client._task_metadata.get("task_id")) is not None and _strict_int(client._task_metadata["task_id"]) > 0):
             task_id = _strict_int(client._task_metadata["task_id"])
@@ -897,6 +1023,8 @@ def _verify_question(client, topic, task_kind, bank, word_defs):
     if (not isinstance(client, Client) or client._task_context is None or client._task_metadata is None
             or client._task_metadata.get("source") != task_kind):
         raise _denied("答案学习和验证需要已核验的任务执行上下文")
+    if client.task_type != (3 if task_kind == "study" else 1):
+        raise _denied("普通学习验证函数不能执行测试")
     _complete_topic(topic, task_kind)
     opts = topic.get("options") or []
     multiple = _is_collocation(topic)
@@ -959,6 +1087,8 @@ def _verify_question(client, topic, task_kind, bank, word_defs):
 def _run_quiz(client, task_id, release_id, task_kind, course_id, list_id, task_type, grade, bank):
     if client._task_context is None:
         raise _denied("答题必须在已核验的任务上下文中运行")
+    if client.task_type != (3 if task_kind == "study" else 1):
+        raise _denied("普通学习答题函数不能执行测试")
     word_defs = {}
     counts = bank.status()
     print(f"📚 精确题库 {counts['formal']} 条，临时缓存 {counts['cache']} 条，历史原文 {counts['legacy']} 条")
@@ -1022,6 +1152,8 @@ def _disp_answer(opts, answer, mode):
 
 def _run_with_selection(client, task_id, release_id=None, *, task_kind="class", course_id=None,
                         list_id=None, task_type=3, grade=2, max_score=10, bank=None):
+    if client.task_type != (3 if task_kind == "study" else 1):
+        raise _denied("选词流程不能执行测试")
     # A stale continue state may fall back to ordinary selection once, never reset repeatedly.
     for attempt in range(2):
         if task_kind == "study":
@@ -1083,11 +1215,13 @@ def run_full(client, task_id=None, release_id=None, task_index=0, max_score=10, 
 
     if not isinstance(client, Client):
         raise _denied("任务执行需要可核验归属的 Client")
-    with client.task_scope("class", task_id=task_id, release_id=release_id):
+    with client.task_scope("class", task_id=task_id, release_id=release_id, expected_type=1):
         return _run_class_scoped(client, task_id, release_id, max_score, bank)
 
 
 def _run_class_scoped(client, task_id, release_id, max_score, bank):
+    if client.task_type != 1:
+        raise _denied("学习流程不能执行测试")
     info = _task_data(client.task_info(task_id, release_id), "读取班级任务信息")
     task_id = _returned_task_id(info, task_id)
     print(f"📋 {info.get('task_name', '?')}")
@@ -1101,6 +1235,32 @@ def _run_class_scoped(client, task_id, release_id, max_score, bank):
     sd = sr.get("data") or {}
     if sd:
         print(f"🏆 签到完成, 累计{sd.get('sign_in_total')}天, 积分+{sd.get('integral')}")
+
+
+def run_test_full(client, task_id, release_id, bank=None):
+    """Run one server-confirmed test attempt, without learning-task side effects."""
+    if not isinstance(client, Client):
+        raise _denied("测试执行需要可核验归属的 Client")
+    with client.task_scope("class", task_id=task_id, release_id=release_id, expected_type=2):
+        if __package__ in (None, ""):
+            from test_runner import run_test
+        else:
+            from .test_runner import run_test
+        bank = bank or default_store()
+        with bank.runtime():
+            return run_test(client, task_id, release_id, bank)
+
+
+def run_class_task(client, task_id, release_id, bank=None):
+    """Dispatch only after the server, never caller arguments, establishes type."""
+    if not isinstance(client, Client):
+        raise _denied("班级任务执行需要可核验归属的 Client")
+    with client.task_scope("class", task_id=task_id, release_id=release_id):
+        if client.task_type == 2:
+            return run_test_full(client, task_id, release_id, bank)
+        if client.task_type == 1:
+            return run_full(client, task_id=task_id, release_id=release_id, bank=bank)
+        raise _denied("服务器任务类型不受支持")
 
 def run_study_full(client, task_id=None, course_id="CET4_v2", list_id=None, task_type=3, grade=2, task_index=0, max_score=10, bank=None):
     try:
@@ -1125,7 +1285,7 @@ def run_study_full(client, task_id=None, course_id="CET4_v2", list_id=None, task
     if not isinstance(client, Client):
         raise _denied("任务执行需要可核验归属的 Client")
     with client.task_scope("study", task_id=task_id, course_id=course_id, list_id=list_id,
-                           task_type=task_type, grade=grade):
+                           task_type=task_type, grade=grade, expected_type=3):
         existing_id = _strict_int(client._task_metadata.get("task_id"))
         if (_strict_int(task_id) is None or _strict_int(task_id) <= 0) and existing_id is not None and existing_id > 0:
             task_id = existing_id
@@ -1195,14 +1355,18 @@ def main():
         auth_v=config["AUTH_V"],
         ua=config.get("USER_AGENT", ""),
     )
-    records = _task_data(client.page_task(), "读取班级任务").get("records")
-    if not isinstance(records, list) or not records or not isinstance(records[0], dict):
-        raise TaskError("没有可选择的班级任务")
-    task_id, release_id = records[0].get("task_id"), records[0].get("release_id")
-    with client.task_scope("class", task_id=task_id, release_id=release_id):
-        bank = prepare_default_store()
-        with bank.runtime():
-            run_full(client, task_id=task_id, release_id=release_id, bank=bank)
+    try:
+        records = _task_data(client.page_task(), "读取班级任务").get("records")
+        if not isinstance(records, list) or not records or not isinstance(records[0], dict):
+            raise TaskError("没有可选择的班级任务")
+        task_id, release_id = records[0].get("task_id"), records[0].get("release_id")
+        with client.task_scope("class", task_id=task_id, release_id=release_id):
+            bank = prepare_default_store()
+            with bank.runtime():
+                run_class_task(client, task_id=task_id, release_id=release_id, bank=bank)
+    finally:
+        client.close()
+        close_thread_sessions()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
 import os, sys, subprocess, threading, time, signal, socket, webbrowser
 import hashlib, json
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 from flask import Flask, jsonify, request, Response
@@ -24,8 +25,10 @@ if __package__ in (None, ""):
     )
     from token_capture import CaptureManager, is_loopback_request
     from bank_store import BankError, prepare_default_store
-    from task_categories import CATEGORY_FIELDS, classify_task
+    from task_categories import CATEGORY_FIELDS, OFFICIAL_STATUS_FIELDS, classify_task
     from task_safety import SafetyStore, SafetyError
+    from task_lists import read_class_tasks
+    from network import LogBuffer
 else:
     from . import a as quiz  # noqa
     from .config import (
@@ -37,8 +40,10 @@ else:
     )
     from .token_capture import CaptureManager, is_loopback_request
     from .bank_store import BankError, prepare_default_store
-    from .task_categories import CATEGORY_FIELDS, classify_task
+    from .task_categories import CATEGORY_FIELDS, OFFICIAL_STATUS_FIELDS, classify_task
     from .task_safety import SafetyStore, SafetyError
+    from .task_lists import read_class_tasks
+    from .network import LogBuffer
 
 app = Flask(__name__)
 
@@ -46,21 +51,31 @@ app = Flask(__name__)
 JOBS = {}  # 稳定任务键 -> 进程及运行状态
 JOBS_LOCK = threading.RLock()
 JOBS_SEQ = 0
-TASKS_FETCH_LOCK = threading.Lock()
 TASK_CACHE_LOCK = threading.RLock()
 TASK_CACHE = {}
 ACCOUNT_CACHE = {}
+TASK_REFRESH = {"scope": None, "epoch": 0, "running": False, "last_attempt": 0,
+                "updated_at": None, "seq": 0, "warnings": []}
+JOB_QUEUE = deque()
+TEST_RESERVATIONS = set()
+DISPATCH_EVENT = threading.Event()
+SHUTTING_DOWN = threading.Event()
+DISPATCH_THREAD = None
 SAFETY = SafetyStore(Path(__file__).resolve().parent.parent)
 RECOVERY_FIELDS = ("recovery_required", "recovery_id", "recovery_reason")
+TEST_STATE_FIELDS = ("test_completed", "test_end_code")
 LOG_MAX = 500
 TASK_METADATA_FIELDS = (
     "source", "source_label", "task_id", "release_id", "course_id", "list_id", "task_type", "grade",
     "task_name", "progress", "score", "free", "over_status", "over_time", "start_time", "release_time", "stale", "account_key",
+    *OFFICIAL_STATUS_FIELDS,
 )
 JOB_STATE_FIELDS = (
     "job_key", "running", "done", "loop", "waiting", "active", "stopped", "status", "has_logs", "exit_code", "round",
     *RECOVERY_FIELDS,
+    *TEST_STATE_FIELDS,
     "account_current",
+    "queued", "starting", "queue_position",
 )
 
 
@@ -74,7 +89,12 @@ def _auth_scope(config):
 
 def _resolve_account(config, client=None):
     """从服务器确认身份；Token 只作为本机列表缓存键。"""
-    key = (client or _client(config)).get_account_key()
+    if client is None:
+        with _client(config) as owned:
+            return _resolve_account(config, owned)
+    key = client.get_account_key()
+    if _auth_scope(config) != _auth_scope(get_runtime_config()):
+        return key
     with TASK_CACHE_LOCK:
         ACCOUNT_CACHE[_auth_scope(config)] = key
     with JOBS_LOCK:
@@ -84,6 +104,8 @@ def _resolve_account(config, client=None):
                 job["cancel_event"].set()
                 job["logs"].append("[loop] 当前账号已改变，停止旧账号的循环")
                 _touch_jobs()
+            if job.get("phase") in {"queued", "starting"} and job.get("account_key") != key:
+                _cancel_pending(job, "当前账号已改变，取消待启动任务")
     return key
 
 
@@ -95,22 +117,31 @@ def _safety_identity(task, account=None):
 
 def _with_recovery(task, account=None, active=False):
     row = dict(task)
-    fields = dict(recovery_required=False, recovery_id=None, recovery_reason=None)
-    if (account or row.get("account_key")) and not active:
+    fields = dict(recovery_required=False, recovery_id=None, recovery_reason=None,
+                  test_completed=False, test_end_code=None)
+    if account or row.get("account_key"):
         try:
             state = SAFETY.inspect(**_safety_identity(row, account))
-            fields.update(recovery_required=bool(state.get("paused")), recovery_id=state.get("recovery_id"),
-                          recovery_reason=state.get("reason"))
+            fields.update(test_completed=bool(state.get("test_completed")), test_end_code=state.get("test_end_code"))
+            if not active:
+                fields.update(recovery_required=bool(state.get("paused")), recovery_id=state.get("recovery_id"),
+                              recovery_reason=state.get("reason"))
         except SafetyError as exc:
-            fields.update(recovery_required=True, recovery_reason=str(exc))
+            if not active:
+                fields.update(recovery_required=True, recovery_reason=str(exc))
     row.update(fields)
+    if row["test_completed"]:
+        row = classify_task(row)
     if row["recovery_required"]:
         row.update(can_start=False, can_loop_start=False, repeatable=False)
     return row
 
 
 def _remote_task(config, source, release_id, course_id=None, list_id=None, client=None):
-    c = client or _client(config)
+    if client is None:
+        with _client(config) as owned:
+            return _remote_task(config, source, release_id, course_id, list_id, owned)
+    c = client
     account = _resolve_account(config, c)
     records = _list_study_tasks(c, course_id) if source == "study" else _list_class_tasks(c)
     matches = [r for r in records if str(r.get("list_id") if source == "study" else r.get("release_id"))
@@ -128,22 +159,27 @@ def _remote_task(config, source, release_id, course_id=None, list_id=None, clien
         for job in JOBS.values():
             if (job.get("account_key") == account and job.get("source") == source
                     and _safety_identity(job) == _safety_identity(row)):
-                job["task_meta"] = task_metadata(row)
+                display_row = _retain_cached_official_status(row, job.get("task_meta")) if source == "class" else row
+                job["task_meta"] = task_metadata(display_row)
                 job["task_confirmed"] = True
                 _touch_jobs()
     return classify_task(row)
 
 
 def _stop_changed_auth_loops(previous, current):
-    if _auth_scope(previous) == _auth_scope(current):
-        return
+    auth_changed = _auth_scope(previous) != _auth_scope(current) or previous.get("USER_AGENT") != current.get("USER_AGENT")
+    study_changed = any(previous.get(k) != current.get(k) for k in ("COURSE_ID", "STUDY_GRADE"))
     with JOBS_LOCK:
         for job in JOBS.values():
-            if job.get("loop"):
+            affected = auth_changed or (study_changed and job.get("source") == "study")
+            if affected and job.get("phase") in {"queued", "starting"}:
+                _cancel_pending(job, "账号或课程配置已变化，取消待启动任务")
+            if affected and job.get("loop"):
                 job["loop"] = False
                 job["cancel_event"].set()
                 job["logs"].append("[loop] 鉴权已更换，停止后续循环；刷新账号和任务后可手动启动")
                 _touch_jobs()
+    DISPATCH_EVENT.set()
 
 
 def _cached_task(config, source, task_id, release_id, course_id=None, list_id=None):
@@ -165,8 +201,22 @@ def _refresh_cached_record(config, source, record, course_id=None):
         rows = TASK_CACHE.get(scope, [])
         for index, row in enumerate(rows):
             if _job_key(source, row.get("task_id"), row.get("release_id"), row.get("course_id"), row.get("list_id")) == key:
-                rows[index] = classify_task({**task_metadata(row), **task_metadata(record), "source": source, "stale": False})
+                refreshed = {**task_metadata(row), **task_metadata(record), "source": source, "stale": False}
+                rows[index] = classify_task(_retain_cached_official_status(refreshed, row) if source == "class" else refreshed)
+                TASK_REFRESH["seq"] += 1
                 break
+
+
+def _retain_cached_official_status(record, previous):
+    """Keep a known display tab while marking a failed current classification stale."""
+    if (record.get("official_status") == "unknown" and previous
+            and previous.get("official_status") in {"ongoing", "ended"}):
+        reason = previous.get("official_status_reason") or "上次明确的词达人官方分类"
+        if "本次官方分类读取失败" not in reason:
+            reason += "；本次官方分类读取失败，保留上次明确分类，请刷新重试"
+        return {**record, **{field: previous[field] for field in OFFICIAL_STATUS_FIELDS if field in previous},
+                "official_status_stale": True, "official_status_reason": reason}
+    return dict(record)
 
 
 def _job_key(source, task_id, release_id, course_id=None, list_id=None, account_key=None):
@@ -174,7 +224,9 @@ def _job_key(source, task_id, release_id, course_id=None, list_id=None, account_
     if source == "study":
         key = (source, str(course_id or "CET4_v2"), str(list_id or release_id))
     else:
-        key = (source, str(task_id), str(release_id))
+        # A new test starts with task_id=-1, then receives its practice ID.
+        # The account and release identify the same task throughout that change.
+        key = (source, "release", str(release_id))
     return (*key, account_key) if account_key else key
 
 
@@ -209,14 +261,21 @@ def _touch_jobs():
 
 
 def _job_active(job):
-    return bool(job and (not job.get("done") or (job.get("loop") and not job.get("stopped"))))
+    return bool(job and (job.get("phase") in {"queued", "starting"} or not job.get("done")
+                        or (job.get("loop") and not job.get("stopped"))))
 
 
 def _job_snapshot(job):
     """只返回公开状态；调用方持有 JOBS_LOCK。"""
     running = not job["done"]
-    waiting = bool(job["done"] and job.get("loop") and not job.get("stopped"))
-    if running:
+    queued = job.get("phase") == "queued"
+    starting = job.get("phase") == "starting"
+    waiting = bool(not queued and not starting and job["done"] and job.get("loop") and not job.get("stopped"))
+    if starting:
+        status = "stopping" if job.get("stopped") else "starting"
+    elif queued:
+        status = "queued"
+    elif running:
         status = "stopping" if job.get("stopped") else "running"
     elif waiting:
         status = "waiting"
@@ -240,6 +299,8 @@ def _job_snapshot(job):
         "loop": bool(job.get("loop")), "waiting": waiting, "active": _job_active(job),
         "stopped": bool(job.get("stopped")), "status": status, "has_logs": True,
         "exit_code": job.get("exit_code"), "round": job.get("round", 1),
+        "queued": queued, "starting": starting,
+        "queue_position": _queue_position(job) if queued else None,
     }
     metadata = job.get("task_meta")
     eligibility = classify_task(metadata or state)
@@ -248,21 +309,27 @@ def _job_snapshot(job):
         current_account = ACCOUNT_CACHE.get(_auth_scope(get_runtime_config()))
     if current_account and current_account != job.get("account_key"):
         state.update(account_current=False, can_start=False, can_loop_start=False,
-                     category="unknown", category_label="待确认", category_reason="旧账号任务，仅保留停止和日志；切回该账号后刷新",
+                     category="unknown", category_label="资格待确认", category_reason="旧账号任务，仅保留停止和日志；切回该账号后刷新",
                      eligibility_reason="当前账号与此任务账号不符", source_label="旧账号 · " + state["source_label"])
     if job.get("account_snapshot") != state["account_current"]:
         job["account_snapshot"] = state["account_current"]
         _touch_jobs()
     if job.get("task_confirmed") is False:
         reason = "远端列表中未确认该任务，保留本机控制和日志；请刷新任务列表"
-        state.update(category="unknown", category_label="待确认", category_reason=reason,
-                     eligibility_reason=reason, can_start=False, can_loop_start=False, repeatable=False)
+        state.update(category="unknown", category_label="资格待确认", category_reason=reason,
+                     eligibility_reason=reason, can_start=False, can_loop_start=False, repeatable=False,
+                     official_status_stale=True)
+        if state.get("official_status") in {"ongoing", "ended"} and state.get("official_status_checked_at", 0) > 0:
+            state["official_status_reason"] = (state.get("official_status_reason") or "上次明确的词达人官方分类") + "；" + reason
+        else:
+            state.update(official_status="unknown", official_status_label="状态待确认", official_status_reason=reason,
+                         official_status_checked_at=0)
     if metadata:
         for field in ("score", "progress"):
             if field in metadata:
                 state[field] = metadata[field]
     state = _with_recovery(state, job.get("account_key"), active=running)
-    recovery = tuple(state[field] for field in RECOVERY_FIELDS)
+    recovery = tuple(state[field] for field in (*RECOVERY_FIELDS, *TEST_STATE_FIELDS))
     if job.get("recovery_snapshot") != recovery:
         job["recovery_snapshot"] = recovery
         _touch_jobs()
@@ -287,9 +354,11 @@ def _merge_jobs(tasks):
             state = _job_snapshot(job)
             if key in rows:
                 same_account = rows[key].get("account_key") == job.get("account_key")
-                rows[key].update({field: state[field] for field in JOB_STATE_FIELDS if same_account or field not in RECOVERY_FIELDS})
+                rows[key].update({field: state[field] for field in JOB_STATE_FIELDS if same_account or field not in (*RECOVERY_FIELDS, *TEST_STATE_FIELDS)})
                 if not same_account:
                     continue
+                if rows[key].get("test_completed"):
+                    rows[key] = classify_task(rows[key])
                 metadata = task_metadata(rows[key])
                 if job.get("task_meta") != metadata or job.get("task_confirmed") is False:
                     job["task_meta"] = metadata
@@ -313,24 +382,26 @@ def _client(config=None):
         cfg["ABC"],
         cfg["AUTH_V"],
         ua=cfg.get("USER_AGENT", ""),
+        config=cfg,
     )
 
 
 def _has_active_jobs():
     """包括正在执行以及循环模式等待重启的任务。"""
     with JOBS_LOCK:
-        return any(_job_active(job) for job in JOBS.values())
+        return bool(TEST_RESERVATIONS) or any(_job_active(job) for job in JOBS.values())
 
 
 def _validate_captured_credentials(credentials):
     try:
-        c = quiz.Client(
+        with quiz.Client(
             credentials["USERTOKEN"],
             credentials["ABC"],
             credentials["AUTH_V"],
             ua=credentials.get("USER_AGENT", ""),
-        )
-        response = c.main_info()
+            config=get_runtime_config(),
+        ) as c:
+            response = c.main_info()
         if response.get("code") != 1:
             return False, response.get("msg") or f"服务端返回 code={response.get('code')}"
         user_info = (response.get("data") or {}).get("user_info") or {}
@@ -354,70 +425,293 @@ def _capture_request_allowed():
     return is_loopback_request(request.remote_addr, origin_host)
 
 
+def _max_concurrency(config=None):
+    return max(1, min(8, _int_or_default((config or get_runtime_config()).get("MAX_CONCURRENT_TASKS"), 4)))
+
+
+def _occupied_slots():
+    return len(TEST_RESERVATIONS) + sum(not job["done"] or job.get("phase") == "starting" for job in JOBS.values())
+
+
+@contextmanager
+def _test_slot(key, config):
+    with JOBS_LOCK:
+        if key in TEST_RESERVATIONS or _job_active(JOBS.get(key)):
+            raise ValueError("任务已在启动或运行")
+        if _occupied_slots() >= _max_concurrency(config):
+            raise ValueError("当前执行名额已满；测试任务不排队，请稍后手动启动")
+        TEST_RESERVATIONS.add(key)
+    try:
+        yield
+    finally:
+        with JOBS_LOCK:
+            TEST_RESERVATIONS.discard(key)
+        DISPATCH_EVENT.set()
+
+
+def _queue_position(target):
+    position = 0
+    for key, job in JOB_QUEUE:
+        if JOBS.get(key) is job and job.get("phase") == "queued":
+            position += 1
+            if job is target:
+                return position
+    return None
+
+
+def _launch_scope(config, source):
+    return (_auth_scope(config), config.get("USER_AGENT", ""),
+            *((config.get("COURSE_ID", "CET4_v2"), config.get("STUDY_GRADE", "2")) if source == "study" else ()))
+
+
+def _cancel_pending(job, reason):
+    """Caller holds JOBS_LOCK. In-flight checks retain their slot until they return."""
+    job["stopped"], job["loop"] = True, False
+    job["cancel_event"].set()
+    if job.get("phase") == "queued":
+        job["phase"] = "stopped"
+    job["logs"].append("[queue] " + reason)
+    _touch_jobs()
+
+
+def _queue_job(source, task_id, release_id, *, config, task_meta, loop=False,
+               course_id=None, list_id=None, grade=None, expected_job=None):
+    global DISPATCH_THREAD
+    with JOBS_LOCK:
+        if SHUTTING_DOWN.is_set() or CAPTURE.is_active():
+            raise ValueError("服务正在退出或获取鉴权，暂不能加入队列")
+        if _launch_scope(config, source) != _launch_scope(get_runtime_config(), source):
+            raise ValueError("配置已变化，请刷新任务列表")
+        checked = _with_recovery(classify_task(task_meta))
+        if quiz._strict_int(checked.get("task_type")) != (3 if source == "study" else 1):
+            raise ValueError("只有学习和自学任务可以排队")
+        if not checked.get("account_key") or not checked.get("can_start") or (loop and not checked.get("can_loop_start")):
+            raise ValueError(checked.get("recovery_reason") or checked.get("category_reason") or "任务资格尚未确认")
+        key = _job_key(source, task_id, release_id, course_id, list_id, checked["account_key"])
+        old = JOBS.get(key)
+        if expected_job is not None:
+            if old is not expected_job or not old.get("done") or not old.get("loop") or old.get("stopped"):
+                raise ValueError("任务状态已变化，取消旧循环")
+        elif _job_active(old):
+            raise ValueError("任务已在运行或排队")
+        logs = old["logs"] if old else LogBuffer(maxlen=LOG_MAX)
+        job = dict(proc=None, logs=logs, done=True, exit_code=None, phase="queued", source=source,
+                   task_id=task_id, release_id=release_id, course_id=course_id, list_id=list_id,
+                   task_type=quiz._strict_int(checked["task_type"]), grade=grade, account_key=checked["account_key"],
+                   task_name=checked.get("task_name"), task_meta=task_metadata(checked), task_confirmed=True,
+                   loop=loop, stopped=False, cancel_event=threading.Event(), round=old.get("round", 0) if old else 0,
+                   launch_scope=_launch_scope(config, source))
+        logs.append("[queue] 已加入队列；轮到本任务时重新确认资格")
+        JOBS[key] = job
+        JOB_QUEUE.append((key, job))
+        _touch_jobs()
+        if DISPATCH_THREAD is None or not DISPATCH_THREAD.is_alive():
+            DISPATCH_THREAD = threading.Thread(target=_dispatch_jobs, name="task-dispatcher", daemon=True)
+            DISPATCH_THREAD.start()
+        DISPATCH_EVENT.set()
+        return job
+
+
+def _dispatch_jobs():
+    while not SHUTTING_DOWN.is_set():
+        DISPATCH_EVENT.wait(1)
+        DISPATCH_EVENT.clear()
+        config = get_runtime_config()
+        launches = []
+        with JOBS_LOCK:
+            for key, job in list(JOB_QUEUE):
+                if JOBS.get(key) is job and job.get("phase") == "queued" and job["launch_scope"] != _launch_scope(config, job["source"]):
+                    _cancel_pending(job, "账号或课程配置已变化，取消排队")
+            while JOB_QUEUE and _occupied_slots() < _max_concurrency(config) and not SHUTTING_DOWN.is_set():
+                key, job = JOB_QUEUE.popleft()
+                if JOBS.get(key) is not job or job.get("phase") != "queued":
+                    continue
+                job["phase"] = "starting"
+                job["logs"].append("[queue] 正在确认账号及最新任务资格")
+                _touch_jobs()
+                launches.append((key, job))
+        for key, job in launches:
+            threading.Thread(target=_prepare_queued_job, args=(key, job), name="task-preflight", daemon=True).start()
+
+
+def _prepare_queued_job(key, job):
+    try:
+        config = get_runtime_config()
+        if job["cancel_event"].is_set() or job["launch_scope"] != _launch_scope(config, job["source"]):
+            raise ValueError("任务已取消或配置已变化")
+        fresh = _remote_task(config, job["source"], job["release_id"], job.get("course_id"), job.get("list_id"))
+        if fresh["account_key"] != job["account_key"]:
+            raise ValueError("账号身份已变化，任务未启动")
+        if (quiz._strict_int(fresh.get("task_type")) != job["task_type"]
+                or (job["source"] == "class" and str(fresh["task_id"]) != str(job["task_id"]))):
+            raise ValueError("服务器任务类型或编号已变化，请刷新后重新选择")
+        with JOBS_LOCK:
+            if (JOBS.get(key) is not job or job["cancel_event"].is_set() or SHUTTING_DOWN.is_set()
+                    or job["launch_scope"] != _launch_scope(get_runtime_config(), job["source"])):
+                raise ValueError("任务已取消或配置已变化")
+            grade = (_int_or_default(fresh.get("grade"), _int_or_default(config.get("STUDY_GRADE"), 2))
+                     if job["source"] == "study" else job.get("grade"))
+            _spawn_job(job["source"], fresh["task_id"], job["release_id"], loop=job["loop"], config=get_runtime_config(),
+                       course_id=job.get("course_id"), list_id=job.get("list_id"), task_type=fresh["task_type"],
+                       grade=grade, task_name=fresh.get("task_name"), task_meta=fresh, expected_job=job)
+    except Exception as exc:
+        with JOBS_LOCK:
+            if JOBS.get(key) is job:
+                job.update(phase="stopped" if job.get("stopped") else "failed", done=True, loop=False,
+                           exit_code=None if job.get("stopped") else 2)
+                job["logs"].append(f"[queue] 未启动：{exc}")
+                _touch_jobs()
+    finally:
+        DISPATCH_EVENT.set()
+
+
+def _shutdown_jobs():
+    SHUTTING_DOWN.set()
+    processes = []
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            job["loop"] = False
+            job["cancel_event"].set()
+            if job.get("phase") in {"queued", "starting"}:
+                _cancel_pending(job, "服务退出，取消待启动任务")
+            elif not job["done"] and job.get("proc"):
+                job["stopped"] = True
+                processes.append(job["proc"])
+                try:
+                    job["proc"].terminate()
+                except OSError:
+                    pass
+        JOB_QUEUE.clear()
+    DISPATCH_EVENT.set()
+    # Keep the bank runtime open until terminated children have had time to exit.
+    # Share one wait budget, rather than waiting the full timeout for every task.
+    deadline = time.monotonic() + 3
+    for proc in processes:
+        try:
+            proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def _list_class_tasks(c):
-    """拉取班级任务, 多页累加。"""
-    out, page = [], 1
-    while True:
-        resp = c.page_task(page=page, size=50)
-        recs = quiz._task_data(resp, "读取班级任务列表", allow_empty=True).get("records") or []
-        if not isinstance(recs, list) or any(not isinstance(row, dict) for row in recs):
-            raise ValueError("班级任务列表格式错误")
-        if not recs:
-            break
-        out.extend(recs)
-        if len(recs) < 50:
-            break
-        page += 1
-        if page > 20:
-            break
-    return out
+    return read_class_tasks(c)
 
 
 def _list_study_tasks(c, course_id):
     """拉取自学任务。"""
+    checked_at = int(time.time() * 1000)
     resp = c.study_task_list(course_id=course_id)
     data = quiz._task_data(resp, "读取自学任务列表", allow_empty=True)
     tasks = data.get("task_list") or []
     if not isinstance(tasks, list) or any(not isinstance(row, dict) for row in tasks):
         raise ValueError("自学任务列表格式错误")
-    return tasks
+    return [{**row, "official_status": "unknown", "official_status_checked_at": checked_at,
+             "official_status_reason": "自学列表未提供官方进行中 / 已结束分类；能否运行请查看程序执行状态"}
+            for row in tasks]
 
 
-def _list_tasks():
-    """串行拉取远端列表；单个来源失败时保留上次成功结果。"""
-    cfg = get_runtime_config()
-    c = _client(cfg)
-    account = _resolve_account(cfg, c)
-    course_id = (cfg.get("COURSE_ID") or "CET4_v2").strip() or "CET4_v2"
-    study_grade = _int_or_default(cfg.get("STUDY_GRADE"), 2)
-    auth_scope = _auth_scope(cfg)
-    out, warnings = [], []
-    with TASKS_FETCH_LOCK:
-        for source, label, course in (("class", "班级", ""), ("study", "自学", course_id)):
-            cache_key = (auth_scope, source, course)
-            try:
-                records = _list_class_tasks(c) if source == "class" else _list_study_tasks(c, course)
-                rows = []
-                for r in records:
-                    rid = r.get("release_id") if source == "class" else r.get("list_id")
-                    row = {"source": source, "source_label": label, "can_start": rid is not None, "account_key": account,
-                           "task_id": r.get("task_id") or 0, "release_id": rid,
-                           "task_name": r.get("task_name"), "progress": r.get("progress"), "score": r.get("score")}
-                    for field in ("task_type", "free", "over_status", "over_time", "start_time", "release_time"):
-                        if field in r:
-                            row[field] = r[field]
-                    if source == "study":
-                        row.update(course_id=r.get("course_id") or course, list_id=rid,
-                                   task_type=r.get("task_type"), grade=_int_or_default(r.get("grade"), study_grade))
-                    rows.append(classify_task(row))
+def _list_scope(config):
+    return (*_launch_scope(config, "study"), config.get("VOCABGO_PROXY_MODE", "direct"), config.get("VOCABGO_PROXY_URL", ""))
+
+
+def _request_task_refresh(config, *, force=False):
+    """Only one upstream refresh runs, regardless of browser count or config churn."""
+    scope = _list_scope(config)
+    launch = None
+    with TASK_CACHE_LOCK:
+        if TASK_REFRESH["scope"] != scope:
+            TASK_REFRESH.update(scope=scope, epoch=TASK_REFRESH["epoch"] + 1, last_attempt=0,
+                                updated_at=None, warnings=[])
+            TASK_REFRESH["seq"] += 1
+        if (not TASK_REFRESH["running"] and not SHUTTING_DOWN.is_set()
+                and (force or time.monotonic() - TASK_REFRESH["last_attempt"] >= 30)):
+            TASK_REFRESH["running"] = True
+            launch = (dict(config), scope, TASK_REFRESH["epoch"])
+    if launch:
+        threading.Thread(target=_refresh_tasks_worker, args=launch, name="task-list-refresh", daemon=True).start()
+
+
+def _refresh_tasks_worker(config, scope, epoch):
+    warnings, any_success = [], False
+    course = str(config.get("COURSE_ID") or "CET4_v2")
+    sources = (("class", "班级", ""), ("study", "自学", course))
+    try:
+        with _client(config) as client:
+            account = client.get_account_key()
+            for source, label, course_id in sources:
+                key = (_auth_scope(config), source, course_id)
                 with TASK_CACHE_LOCK:
-                    TASK_CACHE[cache_key] = rows
-                out.extend(_with_recovery(row) for row in rows)
-            except Exception as exc:
-                warnings.append(f"{label}任务读取失败，已保留上次列表及本机任务: {exc}")
-                with TASK_CACHE_LOCK:
-                    out.extend(_with_recovery(classify_task({**row, "stale": True})) for row in TASK_CACHE.get(cache_key, []))
-    return out, warnings
+                    if TASK_REFRESH["epoch"] != epoch:
+                        break
+                    previous = {str(r.get("release_id")): dict(r) for r in TASK_CACHE.get(key, [])}
+                try:
+                    records = _list_class_tasks(client) if source == "class" else _list_study_tasks(client, course_id)
+                    rows = []
+                    for record in records:
+                        if source == "class":
+                            record = _retain_cached_official_status(record, previous.get(str(record.get("release_id"))))
+                        rid = record.get("release_id") if source == "class" else record.get("list_id")
+                        row = {**task_metadata(record), "source": source, "source_label": label,
+                               "account_key": account, "release_id": rid, "task_id": record.get("task_id") or 0,
+                               "stale": False, "can_start": rid is not None}
+                        if source == "study":
+                            row.update(course_id=record.get("course_id") or course_id, list_id=rid,
+                                       grade=_int_or_default(record.get("grade"), _int_or_default(config.get("STUDY_GRADE"), 2)))
+                        rows.append(classify_task(row))
+                    if source == "class" and any(r.get("official_status") == "unknown" or r.get("official_status_stale") for r in rows):
+                        warnings.append("部分班级任务官方分类本次未确认，保留上次明确分类并标记过期")
+                    with TASK_CACHE_LOCK:
+                        if TASK_REFRESH["epoch"] == epoch and _list_scope(get_runtime_config()) == scope and not CAPTURE.is_active():
+                            TASK_CACHE[key] = rows
+                            ACCOUNT_CACHE[_auth_scope(config)] = account
+                            TASK_REFRESH["seq"] += 1
+                            any_success = True
+                except Exception as exc:
+                    warnings.append(f"{label}读取失败，保留上次列表：{exc}")
+                    with TASK_CACHE_LOCK:
+                        if TASK_REFRESH["epoch"] == epoch:
+                            TASK_CACHE[key] = [{**r, "stale": True} for r in TASK_CACHE.get(key, [])]
+            # Stop obsolete queues/loops only after confirming a current account.
+            if _list_scope(get_runtime_config()) == scope:
+                with JOBS_LOCK:
+                    for job in JOBS.values():
+                        if job.get("account_key") != account:
+                            if job.get("phase") in {"queued", "starting"}:
+                                _cancel_pending(job, "当前账号已改变，取消待启动任务")
+                            if job.get("loop"):
+                                job["loop"] = False
+                                job["cancel_event"].set()
+                                _touch_jobs()
+    except Exception as exc:
+        warnings.append(f"账号读取失败，保留上次列表：{exc}")
+        with TASK_CACHE_LOCK:
+            if TASK_REFRESH["epoch"] == epoch:
+                for source, _, course_id in sources:
+                    key = (_auth_scope(config), source, course_id)
+                    TASK_CACHE[key] = [{**r, "stale": True} for r in TASK_CACHE.get(key, [])]
+    finally:
+        with TASK_CACHE_LOCK:
+            TASK_REFRESH["running"] = False
+            if TASK_REFRESH["epoch"] == epoch:
+                TASK_REFRESH.update(last_attempt=time.monotonic(), warnings=warnings)
+                if any_success:
+                    TASK_REFRESH["updated_at"] = int(time.time() * 1000)
+                TASK_REFRESH["seq"] += 1
+            superseded = TASK_REFRESH["epoch"] != epoch
+        if superseded and not SHUTTING_DOWN.is_set() and not CAPTURE.is_active():
+            current = get_runtime_config()
+            if not get_missing_auth_fields(current):
+                _request_task_refresh(current)
+
+
+def _cached_tasks_snapshot(config):
+    scope = _auth_scope(config)
+    course = str(config.get("COURSE_ID") or "CET4_v2")
+    with TASK_CACHE_LOCK:
+        tasks = [dict(row) for key in ((scope, "class", ""), (scope, "study", course)) for row in TASK_CACHE.get(key, [])]
+        state = {"refreshing": TASK_REFRESH["running"], "updated_at": TASK_REFRESH["updated_at"],
+                 "tasks_seq": TASK_REFRESH["seq"], "warnings": list(TASK_REFRESH["warnings"])}
+    return tasks, state
 
 
 def _reader_thread(job_id, proc, job=None):
@@ -439,8 +733,10 @@ def _reader_thread(job_id, proc, job=None):
         if JOBS.get(job_id) is not job:
             return
         job["done"] = True
+        job["phase"] = "completed"
         job["exit_code"] = proc.returncode
         _touch_jobs()
+        DISPATCH_EVENT.set()
         if proc.returncode != 0:
             job["loop"] = False
             job["logs"].append("[loop] 本轮异常退出，已停止循环；结果不明时须在官方端核对后重新同步")
@@ -500,10 +796,9 @@ def _reader_thread(job_id, proc, job=None):
                 _touch_jobs()
                 return
             try:
-                _spawn_job(job["source"], eligibility["task_id"], job["release_id"], loop=True, config=config,
+                _queue_job(job["source"], eligibility["task_id"], job["release_id"], loop=True, config=config,
                            course_id=job.get("course_id"), list_id=job.get("list_id"),
-                           task_type=job.get("task_type"), grade=job.get("grade"),
-                           task_name=job.get("task_name"), task_meta=eligibility, expected_job=job)
+                           grade=job.get("grade"), task_meta=eligibility, expected_job=job)
             except Exception as exc:
                 job["loop"] = False
                 job["exit_code"] = 1
@@ -514,7 +809,11 @@ def _reader_thread(job_id, proc, job=None):
 def _query_score(source, task_id, release_id, course_id=None, list_id=None, expected_account=None):
     """轻量查询单个任务当前分数"""
     config = get_runtime_config()
-    c = _client(config)
+    with _client(config) as c:
+        return _query_score_with_client(c, config, source, task_id, release_id, course_id, list_id, expected_account)
+
+
+def _query_score_with_client(c, config, source, task_id, release_id, course_id, list_id, expected_account):
     account = _resolve_account(config, c)
     if expected_account and account != expected_account:
         raise ValueError("当前账号已改变，不能继续旧账号的任务")
@@ -555,18 +854,34 @@ def _spawn_job_locked(source, task_id, release_id, loop, config, course_id, list
     key = _job_key(source, task_id, release_id, course_id, list_id, (task_meta or {}).get("account_key"))
     old = JOBS.get(key)
     if expected_job is not None:
-        if old is not expected_job or old.get("stopped") or not old.get("loop") or not old.get("done"):
+        if old is not expected_job or old.get("stopped") or old.get("phase") != "starting":
             raise ValueError("任务状态已变化，取消旧循环重启")
     elif _job_active(old):
         raise ValueError("任务正在运行或等待循环重启")
+    elif key not in TEST_RESERVATIONS and _occupied_slots() >= _max_concurrency(config):
+        raise ValueError("当前执行名额已满")
+    if SHUTTING_DOWN.is_set():
+        raise ValueError("服务正在退出，任务未启动")
     account = (task_meta or {}).get("account_key")
     if not account:
         raise ValueError("账号尚未由服务器确认，请刷新任务列表")
     if expected_job and account != expected_job.get("account_key"):
         raise ValueError("当前账号已改变，取消旧账号的循环")
-    checked = _with_recovery(task_meta, account)
+    checked = _with_recovery(classify_task(task_meta or {}), account)
     if checked["recovery_required"]:
         raise SafetyError(checked["recovery_reason"] or "提交状态需核对")
+    server_type = quiz._strict_int(checked.get("task_type"))
+    if (checked.get("source") != source or server_type not in ({1, 2} if source == "class" else {3})
+            or str(checked.get("task_id")) != str(task_id)):
+        raise ValueError("服务器任务类型或编号未确认，任务未启动")
+    if source == "class" and str(checked.get("release_id")) != str(release_id):
+        raise ValueError("服务器发布编号不符，任务未启动")
+    if source == "class" and server_type == 2 and loop:
+        raise ValueError("测试仅支持单次执行，不能自动循环")
+    if not checked.get("can_start") or (loop and not checked.get("can_loop_start")):
+        raise ValueError(checked.get("category_reason") or "任务当前不允许启动或循环")
+    task_type = server_type
+    task_meta = checked
     if source == "study":
         args = ["study", str(task_id), str(list_id or release_id), str(course_id or "CET4_v2"), str(task_type or 3), str(grade or 2)]
     else:
@@ -582,14 +897,15 @@ def _spawn_job_locked(source, task_id, release_id, loop, config, course_id, list
     # 保留旧的 logs (循环模式下追加)
     if old and old.get("account_key") != account:
         old = None
-    logs = old["logs"] if old else deque(maxlen=LOG_MAX)
-    if old:
+    logs = old["logs"] if old else LogBuffer(maxlen=LOG_MAX)
+    if old and old.get("round", 0):
         logs.append(f"========== 第 {old.get('round', 1) + 1} 轮启动 ==========")
     job = {
         "proc": proc,
         "logs": logs,
         "started": time.time(),
         "done": False,
+        "phase": "running",
         "exit_code": None,
         "source": source,
         "release_id": release_id,
@@ -606,7 +922,7 @@ def _spawn_job_locked(source, task_id, release_id, loop, config, course_id, list
         "stopped": False,
         "no_pending_words": False,
         "cancel_event": threading.Event(),
-        "round": (old.get("round", 1) + 1) if old else 1,
+        "round": (old.get("round", 0) + 1) if old else 1,
     }
     JOBS[key] = job
     _touch_jobs()
@@ -642,8 +958,16 @@ def api_config():
 def api_save_config():
     body = request.get_json(force=True) or {}
     previous = get_runtime_config()
-    saved = save_runtime_config(body)
+    try:
+        saved = save_runtime_config(body)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     _stop_changed_auth_loops(previous, saved)
+    if _list_scope(previous) != _list_scope(saved):
+        with TASK_CACHE_LOCK:
+            TASK_REFRESH.update(scope=_list_scope(saved), epoch=TASK_REFRESH["epoch"] + 1,
+                                last_attempt=0, updated_at=None, warnings=[])
+            TASK_REFRESH["seq"] += 1
     return jsonify({
         "ok": True,
         "config": saved,
@@ -681,16 +1005,16 @@ def api_capture_cancel():
 def api_tasks():
     if CAPTURE.is_active():
         return jsonify({"ok": False, "capturing": True, "error": "正在获取鉴权，任务列表已暂停刷新"}), 409
-    try:
-        tasks, warnings = _list_tasks()
-    except ValueError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    config = get_runtime_config()
+    missing = get_missing_auth_fields(config)
+    if missing:
+        return jsonify({"ok": False, "error": f"请先填写配置: {', '.join(missing)}"}), 400
+    _request_task_refresh(config, force=request.args.get("refresh") == "1")
+    tasks, refresh = _cached_tasks_snapshot(config)
     if CAPTURE.is_active():
         return jsonify({"ok": False, "capturing": True, "error": "正在获取鉴权，任务列表已暂停刷新"}), 409
     with JOBS_LOCK:
-        return jsonify({"ok": True, "tasks": _merge_jobs(tasks), "warnings": warnings,
+        return jsonify({"ok": True, "tasks": _merge_jobs(tasks), **refresh,
                         "jobs": [_job_snapshot(job) for job in JOBS.values()], "seq": JOBS_SEQ})
 
 
@@ -718,8 +1042,11 @@ def _request_task(body, config=None):
         raise ValueError("任务编号格式错误") from None
     if source == "study" and task_id == -1:
         task_id = 0
-    if task_id < 0 or (source == "class" and task_id == 0) or release_id in (None, ""):
+    if (task_id < (-1 if source == "class" else 0) or (source == "class" and task_id == 0)
+            or release_id in (None, "") or (source == "class" and release_id <= 0)):
         raise ValueError("任务编号不完整")
+    # -1 is only a syntactic placeholder here. Starting still requires cached
+    # and fresh server metadata to confirm an eligible, unopened class test.
     cfg = config or get_runtime_config()
     course_id = str(body.get("course_id") or cfg.get("COURSE_ID") or "CET4_v2").strip() if source == "study" else None
     list_id = body.get("list_id") or release_id
@@ -734,7 +1061,6 @@ def api_start():
     config = get_runtime_config()
     try:
         source, task_id, release_id, course_id, list_id = _request_task(body, config)
-        task_type = int(body.get("task_type") or 3)
     except (TypeError, ValueError) as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     grade = _int_or_default(body.get("grade") or config.get("STUDY_GRADE"), 2)
@@ -742,8 +1068,31 @@ def api_start():
     missing = get_missing_auth_fields(config)
     if missing:
         return jsonify({"ok": False, "error": f"请先填写配置: {', '.join(missing)}"}), 400
-    if not _cached_task(config, source, task_id, release_id, course_id, list_id):
+    cached = _cached_task(config, source, task_id, release_id, course_id, list_id)
+    if not cached:
         return jsonify({"ok": False, "error": "当前任务信息尚未确认，请先刷新任务列表"}), 409
+    if body.get("account_key") is not None and body["account_key"] != cached.get("account_key"):
+        return jsonify({"ok": False, "error": "所选任务属于其他账号，请刷新当前账号的任务列表"}), 409
+    if source == "class" and str(cached.get("task_id")) != str(task_id):
+        return jsonify({"ok": False, "error": "服务器任务编号已变化，请刷新后重新选择"}), 409
+    if source == "class" and quiz._strict_int(cached.get("task_type")) == 2:
+        key = _job_key(source, task_id, release_id, course_id, list_id, cached.get("account_key"))
+        try:
+            with _test_slot(key, config):
+                return _start_test(config, body, source, task_id, release_id, course_id, list_id, grade, loop)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+    try:
+        job = _queue_job(source, task_id, release_id, loop=loop, config=config, course_id=course_id,
+                         list_id=list_id, grade=grade, task_meta=cached)
+        with JOBS_LOCK:
+            job = _find_job(source, task_id, release_id, course_id, list_id, cached.get("account_key")) or job
+            return jsonify({"ok": True, "job": _job_snapshot(job), "seq": JOBS_SEQ})
+    except (ValueError, SafetyError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+
+
+def _start_test(config, body, source, task_id, release_id, course_id, list_id, grade, loop):
     try:
         fresh = _with_recovery(_remote_task(config, source, release_id, course_id, list_id))
         if body.get("account_key") is not None and body["account_key"] != fresh["account_key"]:
@@ -757,14 +1106,16 @@ def api_start():
             return jsonify({"ok": False, "error": "正在获取鉴权，暂不能启动任务"}), 409
         if _auth_scope(config) != _auth_scope(get_runtime_config()):
             return jsonify({"ok": False, "error": "鉴权已变化，请刷新账号和任务"}), 409
-        eligibility = _with_recovery(fresh)
+        eligibility = _with_recovery(classify_task(fresh))
         if eligibility["recovery_required"]:
             return jsonify({"ok": False, "error": eligibility["recovery_reason"] or "提交状态需核对", "task": eligibility}), 409
         if not eligibility["can_start"] or (loop and not eligibility["can_loop_start"]):
             return jsonify({"ok": False, "error": eligibility["category_reason"] + ("；不能自动循环" if loop and eligibility["can_start"] else ""),
                             "task": eligibility}), 409
         task_id = eligibility["task_id"]
-        task_type = eligibility.get("task_type") or task_type
+        task_type = quiz._strict_int(eligibility.get("task_type"))
+        if task_type != 2 or source != "class":
+            return jsonify({"ok": False, "error": "服务器任务类型未确认，请刷新任务列表", "task": eligibility}), 409
         job = _find_job(source, task_id, release_id, course_id, list_id, eligibility.get("account_key"))
         if _job_active(job):
             return jsonify({"ok": False, "error": "任务正在运行或等待循环重启",
@@ -788,13 +1139,12 @@ def api_start_all():
         missing = get_missing_auth_fields(config)
         if missing:
             return jsonify({"ok": False, "error": f"请先填写配置: {', '.join(missing)}"}), 400
-        c = _client(config)
-        account = _resolve_account(config, c)
-        tasks = _list_class_tasks(c)
-        tasks = [_with_recovery(classify_task({**task_metadata(row), "source": "class", "source_label": "班级", "account_key": account})) for row in tasks]
         with TASK_CACHE_LOCK:
-            TASK_CACHE[(_auth_scope(config), "class", "")] = tasks
-        started = 0
+            tasks = [dict(row) for row in TASK_CACHE.get((_auth_scope(config), "class", ""), [])]
+        if not tasks:
+            _request_task_refresh(config)
+            return jsonify({"ok": False, "error": "正在后台读取班级任务，请待列表更新后重试"}), 409
+        queued = 0
         skipped = 0
         with JOBS_LOCK:
             if CAPTURE.is_active():
@@ -804,17 +1154,18 @@ def api_start_all():
             for r in tasks:
                 tid = r.get("task_id")
                 rid = r.get("release_id")
-                job = _find_job("class", tid, rid, account_key=account)
+                job = _find_job("class", tid, rid, account_key=r.get("account_key"))
                 if _job_active(job):
                     skipped += 1
                     continue
-                r = _with_recovery(r)
-                if r["category"] != "available" or not r["can_loop_start"]:
+                r = _with_recovery(classify_task(r))
+                if quiz._strict_int(r.get("task_type")) != 1 or r["category"] != "available" or not r["can_loop_start"]:
                     skipped += 1
                     continue
-                _spawn_job("class", tid, rid, loop=True, config=config, task_name=r.get("task_name"), task_type=r.get("task_type"), task_meta=r)
-                started += 1
-            return jsonify({"ok": True, "started": started, "skipped": skipped,
+                _queue_job("class", tid, rid, loop=True, config=config, task_meta=r)
+                queued += 1
+            return jsonify({"ok": True, "started": 0, "queued": queued, "accepted": queued, "skipped": skipped,
+                            "max_concurrent_tasks": _max_concurrency(config),
                             "jobs": [_job_snapshot(job) for job in JOBS.values()], "seq": JOBS_SEQ})
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -901,6 +1252,8 @@ def api_stop():
         job["stopped"] = True
         job["loop"] = False
         job["cancel_event"].set()
+        if job.get("phase") in {"queued", "starting"}:
+            _cancel_pending(job, "已手动取消，尚未启动的任务不会执行")
         _touch_jobs()
         if not job["done"]:
             try:
@@ -909,6 +1262,7 @@ def api_stop():
                 pass  # 进程恰好退出，由 reader 收尾
             except Exception as exc:
                 return jsonify({"ok": False, "error": str(exc), "job": _job_snapshot(job), "seq": JOBS_SEQ}), 500
+        DISPATCH_EVENT.set()
         return jsonify({"ok": True, "job": _job_snapshot(job), "seq": JOBS_SEQ})
 
 
@@ -946,7 +1300,10 @@ def _logs_response(job, task=None):
                             "loop": False, "stopped": False, "exit_code": 3, "status": "recovery_required"})
         return jsonify({"ok": False, "logs": [], "error": "本次服务中还没有该任务的日志"}), 404
     state = _job_snapshot(job)
-    return jsonify({"ok": True, "logs": list(job["logs"]), "job": state, "seq": JOBS_SEQ,
+    if not isinstance(job["logs"], LogBuffer):
+        job["logs"] = LogBuffer(job["logs"], maxlen=LOG_MAX)
+    delta = job["logs"].since(request.args.get("cursor"))
+    return jsonify({"ok": True, **delta, "job": state, "seq": JOBS_SEQ,
                     "done": state["done"], "exit_code": state["exit_code"],
                     "active": state["active"], "waiting": state["waiting"],
                     "loop": state["loop"], "stopped": state["stopped"], "status": state["status"]})
@@ -961,6 +1318,7 @@ _INDEX_HTML = '''<!doctype html>
 <title>词达人 控制台</title>
 <style>
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
          margin: 0; padding: 24px; background: #f5f7fb; color: #1d1d1f; }
   h1 { font-size: 26px; margin: 0 0 8px; }
@@ -985,7 +1343,7 @@ _INDEX_HTML = '''<!doctype html>
   .grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 16px; }
   .field { display: flex; flex-direction: column; gap: 8px; }
   .field label { font-size: 13px; font-weight: 600; color: #344054; }
-  .field input { width: 100%; border: 1px solid #d0d5dd; border-radius: 10px; padding: 10px 12px; font: inherit; }
+  .field input, .field select { width: 100%; border: 1px solid #d0d5dd; border-radius: 10px; padding: 10px 12px; font: inherit; }
   .field small { color: #667085; font-size: 12px; }
   .full { grid-column: 1 / -1; }
   .status-box { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: #f8fafc; border: 1px solid #e2e8f0; color: #475467; font-size: 12px; }
@@ -1007,15 +1365,25 @@ _INDEX_HTML = '''<!doctype html>
   .badge.run { background: #fff3cd; color: #856404; }
   .badge.done { background: #d4edda; color: #155724; }
   .badge.fail { background: #fee4e2; color: #b42318; }
+  .task-sources { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid #f2f4f7; }
+  .task-sources button { padding: 8px 18px; font-weight: 600; }
+  .task-sources button.selected { background: #007aff; border-color: #007aff; color: white; }
+  .task-sources button.selected:hover { background: #0062cc; }
   .task-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; align-items: center; }
   .task-filters button.selected { background: #eaf3ff; border-color: #007aff; color: #0059bf; }
-  .task-filters select { padding: 7px 10px; border: 1px solid #d2d2d7; border-radius: 6px; font: inherit; }
   .filter-summary { color: #667085; font-size: 13px; }
-  .category { display: inline-block; font-size: 11px; border-radius: 6px; padding: 2px 6px; margin-top: 6px; }
-  .category.available { color: #175cd3; background: #eff8ff; }
-  .category.full { color: #027a48; background: #ecfdf3; }
-  .category.blocked { color: #b42318; background: #fef3f2; }
-  .category.unknown { color: #b54708; background: #fffaeb; }
+  .other-source-activity { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; padding: 10px 12px; border: 1px solid #dbeafe; border-radius: 8px; background: #eff6ff; color: #175cd3; font-size: 13px; }
+  .task-badges { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 5px; }
+  .badge.source { color: #475467; background: #f2f4f7; }
+  .badge.task-kind { color: #6941c6; background: #f4f3ff; }
+  .official-status.ongoing { color: #027a48; background: #ecfdf3; }
+  .official-status.ended { color: #475467; background: #f2f4f7; }
+  .official-status.unknown { color: #b54708; background: #fffaeb; }
+  .execution.runnable { color: #175cd3; background: #eff8ff; }
+  .execution.full { color: #027a48; background: #ecfdf3; }
+  .execution.unsupported { color: #6941c6; background: #f4f3ff; }
+  .execution.blocked, .execution.recovery { color: #b42318; background: #fef3f2; }
+  .execution.unknown { color: #b54708; background: #fffaeb; }
   .task-reason { color: #667085; font-size: 12px; max-width: 420px; line-height: 1.5; margin-top: 4px; }
   .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 100; }
   .modal.show { display: flex; align-items: center; justify-content: center; }
@@ -1112,6 +1480,27 @@ _INDEX_HTML = '''<!doctype html>
             <input id="LLM_KEY" type="password" autocomplete="off" />
             <small>Bearer token / API Key。</small>
           </div>
+          <div class="field full">
+            <label for="MAX_CONCURRENT_TASKS">同时执行的任务数</label>
+            <input id="MAX_CONCURRENT_TASKS" type="number" min="1" max="8" placeholder="4" />
+            <small>默认 4 个，其余学习任务排队。降低上限后，已运行任务会先完成；测试名额不足时需稍后手动启动。</small>
+          </div>
+          <div class="field">
+            <label for="VOCABGO_PROXY_MODE">词达人网络路线</label>
+            <select id="VOCABGO_PROXY_MODE"><option value="direct">直连（默认）</option><option value="system">系统代理</option><option value="custom">指定代理</option></select>
+          </div>
+          <div class="field">
+            <label for="LLM_PROXY_MODE">模型网络路线</label>
+            <select id="LLM_PROXY_MODE"><option value="direct">直连（默认）</option><option value="system">系统代理</option><option value="custom">指定代理</option></select>
+          </div>
+          <div class="field" id="VOCABGO_PROXY_FIELD" hidden>
+            <label for="VOCABGO_PROXY_URL">词达人代理地址</label>
+            <input id="VOCABGO_PROXY_URL" type="password" autocomplete="off" placeholder="http://127.0.0.1:7890" />
+          </div>
+          <div class="field" id="LLM_PROXY_FIELD" hidden>
+            <label for="LLM_PROXY_URL">模型代理地址</label>
+            <input id="LLM_PROXY_URL" type="password" autocomplete="off" placeholder="http://127.0.0.1:7890" />
+          </div>
         </div>
 
         <div class="bar" style="margin-top:18px; margin-bottom:0; justify-content:space-between;">
@@ -1129,25 +1518,28 @@ _INDEX_HTML = '''<!doctype html>
       <div class="card-head">
         <div>
           <h2>任务面板</h2>
-          <p>启动后会在子进程里执行刷题流程，日志可实时查看。</p>
+          <p>班级与自学分开查看和操作；每个来源按官方已结束状态分类，能否启动请查看行内原因。</p>
         </div>
         <div class="status-box">运行状态实时更新 · 分数每 30 秒刷新</div>
       </div>
       <div class="card-body">
+        <div class="task-sources" id="task-sources" aria-label="任务来源">
+          <button type="button" data-source="class" class="selected" aria-pressed="true">班级任务</button>
+          <button type="button" data-source="study" aria-pressed="false">自学任务</button>
+        </div>
         <div class="bar">
-          <button id="refresh-tasks" onclick="loadTasks()">🔄 刷新任务</button>
-          <button id="start-all" class="loop" onclick="startAllClassLoop()">🚀 循环启动可继续的班级任务</button>
+          <button id="refresh-tasks" onclick="loadTasks(true)">🔄 刷新任务</button>
+          <button id="start-all" class="loop" onclick="startAllClassLoop()">🚀 一键循环班级学习任务</button>
           <span id="status">加载中...</span>
         </div>
-        <div class="task-filters" id="task-filters" aria-label="任务分类">
-          <button data-filter="all" class="selected" aria-pressed="true">全部</button>
-          <button data-filter="available" aria-pressed="false">未完成可继续</button>
-          <button data-filter="full" aria-pressed="false">已满分</button>
-          <button data-filter="blocked" aria-pressed="false">不可执行</button>
-          <button data-filter="unknown" aria-pressed="false">待确认</button>
-          <label for="source-filter">来源</label>
-          <select id="source-filter"><option value="all">全部来源</option><option value="class">班级</option><option value="study">自学</option></select>
+        <div class="task-filters" id="task-filters" aria-label="词达人任务状态">
+          <button type="button" data-filter="executable" class="selected" aria-pressed="true">可执行</button>
+          <button type="button" data-filter="ended" aria-pressed="false">已结束</button>
           <span class="filter-summary" id="filter-summary" role="status"></span>
+        </div>
+        <div class="other-source-activity" id="other-source-activity" hidden>
+          <span id="other-source-summary" role="status"></span>
+          <button type="button" id="switch-other-source" data-role="source-switch">查看自学任务</button>
         </div>
         <table>
           <thead>
@@ -1156,7 +1548,7 @@ _INDEX_HTML = '''<!doctype html>
               <th>任务名</th>
               <th style="width:160px">进度</th>
               <th style="width:80px">分数</th>
-              <th style="width:80px">状态</th>
+              <th style="width:220px">类型 · 官方状态 · 执行资格</th>
               <th style="width:200px">操作</th>
             </tr>
           </thead>
@@ -1201,7 +1593,10 @@ def main():
             print(f"📄 配置文件: {env_file_path()}")
             if os.environ.get("CIDAREN_NO_BROWSER") != "1":
                 threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{port}")).start()
-            app.run(host=host, port=port, debug=False, threaded=True)
+            try:
+                app.run(host=host, port=port, debug=False, threaded=True)
+            finally:
+                _shutdown_jobs()
     except BankError as exc:
         raise SystemExit(f'词库错误: {exc}')
 

@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -38,6 +39,11 @@ CONFIG_FIELDS = [
     "LLM_MODEL",
     "COURSE_ID",
     "STUDY_GRADE",
+    "MAX_CONCURRENT_TASKS",
+    "VOCABGO_PROXY_MODE",
+    "VOCABGO_PROXY_URL",
+    "LLM_PROXY_MODE",
+    "LLM_PROXY_URL",
 ]
 
 DEFAULT_CONFIG = {
@@ -50,6 +56,11 @@ DEFAULT_CONFIG = {
     "LLM_MODEL": "step-3.6",
     "COURSE_ID": "CET4_v2",
     "STUDY_GRADE": "2",
+    "MAX_CONCURRENT_TASKS": "4",
+    "VOCABGO_PROXY_MODE": "direct",
+    "VOCABGO_PROXY_URL": "",
+    "LLM_PROXY_MODE": "direct",
+    "LLM_PROXY_URL": "",
 }
 
 REQUIRED_AUTH_FIELDS = ("USERTOKEN", "ABC", "AUTH_V")
@@ -104,6 +115,8 @@ def get_runtime_config() -> dict[str, str]:
 
 
 def save_runtime_config(payload: dict[str, object]) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        raise ValueError("配置必须是 JSON 对象")
     current = load_env_file()
     for key in CONFIG_FIELDS:
         if key not in payload:
@@ -113,6 +126,24 @@ def save_runtime_config(payload: dict[str, object]) -> dict[str, str]:
 
     merged = dict(DEFAULT_CONFIG)
     merged.update(current)
+    try:
+        limit = int(merged["MAX_CONCURRENT_TASKS"])
+    except (ValueError, TypeError):
+        raise ValueError("并发任务数需要填写 1 到 8 的整数") from None
+    if not 1 <= limit <= 8:
+        raise ValueError("并发任务数需要填写 1 到 8 的整数")
+    for prefix in ("VOCABGO", "LLM"):
+        mode = merged[f"{prefix}_PROXY_MODE"]
+        if mode not in {"direct", "system", "custom"}:
+            raise ValueError("代理模式必须为 direct、system 或 custom")
+        if mode == "custom":
+            try:
+                parsed = urlsplit(merged[f"{prefix}_PROXY_URL"])
+                valid = parsed.scheme in {"http", "https"} and parsed.hostname and parsed.port != 0
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError(f"{prefix}_PROXY_URL 需要有效的 http:// 或 https:// 代理地址")
 
     lines = [
         "# cidaren runtime config",
@@ -136,6 +167,11 @@ def save_runtime_config(payload: dict[str, object]) -> dict[str, str]:
         f"STUDY_GRADE={_format_env_value(merged.get('STUDY_GRADE', ''))}",
         "",
     ])
+
+    lines.extend(["# 并发和网络路线"])
+    for key in ("MAX_CONCURRENT_TASKS", "VOCABGO_PROXY_MODE", "VOCABGO_PROXY_URL", "LLM_PROXY_MODE", "LLM_PROXY_URL"):
+        lines.append(f"{key}={_format_env_value(merged[key])}")
+    lines.append("")
 
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
